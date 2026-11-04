@@ -1,530 +1,590 @@
 # AAC-suite — MVP Plan (ArcheAge Classic assistant)
 
-> Status: **plan only, no code.** Scope: gold profit, time tracking and leadership tracking.
-> Date: 2026-11-04
+> Status: **plan only, no code.** Version 2, 2026-11-04.
+> Scope: gold profit across all activities, time tracking, leadership tracking, and an hourly AI check-in.
+
+### What changed since v1
+
+- Built against the real `api.lua`: 206 `UI_EVENTS`, about 120 API functions, and the 5 events named in the `api.On` comment.
+- Matched to the PlayerDB/RaidsDB pattern: the addon writes Lua-table `.dat` files, and the sync app sends them unmodified (PlayerDBSync).
+- Platform is **Linux + Proton**, not Windows.
+- Leadership is now a **hero-month target** (4,000 points → 90,000 g + ring). It cannot be spent and resets each period.
+- Profit is **broadened to every activity**: packs, fishing, ganking, larceny/mob farming, crafting, gathering. The Excel crafting loop is replaced by a simpler "best labor sink" loop.
+- Labor model facts are in: 40 per 5 min online and offline, 10,000 cap, Coin = copper.
 
 ---
 
-## 0. Input status (read first)
+## 0. Inputs and what they settled
 
-| Input | Status | Effect on this plan |
-|---|---|---|
-| `/mnt/user-data/uploads/1793764470457_api.lua` | **Not in the session.** The uploads folder is empty. | Every API function name and every `UI_EVENTS` entry below is a **placeholder to be confirmed**. The plan is built so nothing depends on a specific event name until the event test (Stage 2) checks it. |
-| `/mnt/skills/plugins/aa-classic-profit/scripts/analyze.py` | Path missing. The same file was read from the installed `aa-classic-profit` skill. | Reused as the planner (§7.4). |
-| `/mnt/skills/plugins/aa-classic-profit/scripts/ledger.py` | Same as above. | Its workbook schema becomes Postgres tables (§5.5). |
+| Input | What it settled |
+|---|---|
+| `api.lua` (attached) | The full list of available API calls. **The `api.On` comment documents five events: `UPDATE` (dt, every frame), `CHAT_MESSAGE`, `TEAM_MEMBERS_CHANGED`, `UI_RELOADED`, `UPDATE_PING_INFO`.** `UPDATE` is *not* in `UI_EVENTS`. The other **206 `UI_EVENTS` entries are unverified** until the event test (§13) sees them fire. |
+| PlayerDBSync (github.com/Madpeterz/PlayerDBSync) | Addon output is `*.dat` files holding a **Lua table literal** (from `api.File:Write(path, tbl)`), with an `addon_version = "x.y.z"` field. The addon keeps the bookkeeping files `_count.dat` and `_files.dat` itself, because the API cannot list a directory. The app uploads changed files **unmodified**, deduplicated by SHA-256, in batches. **The channel works both ways while the game runs:** the app rewrites `RaidsDB/ignore.dat` every 15 min and answers `Demos/request.dat` (`{ status = true }` → `false`), and the addon reads those files. |
+| `analyze.py`, `ledger.py` (aa-classic-profit skill) | The recursive buy-vs-craft coster and the s/l ranking are kept as a library. The Excel ledger loop is **retired** (§7). |
+| Your notes | Linux/Proton path · leadership rules · currency units · labor regen and cap · daily reset · timers-page DST bug · in-game time cycle · broadened activity scope |
 
-**Ground rule from the brief:** every `UI_EVENTS` entry is **unverified**. The comment on `api.On` names only five events, called **E1–E5** below until `api.lua` is supplied. Even E1–E5 are marked *documented-unverified*, not *verified*. An event is **verified** only once the event test has seen it fire with a known argument shape during a scripted action.
+**Not reachable from this session:** the PlayerDB/RaidsDB example addons on your PC (no computer folder is shared). See §11, item 1.
 
 ---
 
 ## 1. Architecture
 
 ```
- ArcheAge Classic client
-   └─ Lua addon "aacs_probe" / "aacs_capture"
-        writes chunk files ──► ~/Documents/AAClassic/Addon/aacs/out/*.jsonl
-                                       │
- Go uploader (Windows tray app / service)
-   watch → validate footer → hash → INSERT raw → move to archive/
-                                       │
- Postgres  raw.*  (immutable)  ──►  rules engine (Python worker)
-                                     ├─ normalize → core.* (sessions, samples, segments)
-                                     ├─ planner (analyze.py) → econ.plan*
-                                     ├─ question generator → assistant.question
-                                     └─ check-in scheduler → assistant.checkin
-                                       │
- Website (FastAPI + htmx, served locally)
-   dashboard · ledger · check-in chat · event catalog · budget
-                                       │
- LLM router ── local LLM (Ollama/LM Studio) for cheap tasks
-            └─ Claude API (Sonnet 5.5 / Haiku 5.5) for suggestions, with a hard $ cap
+ArcheAge Classic (Proton)
+  addon "aacs"  ── api.File:Write ──►  …/Documents/AAClassic/Addon/aacs/out/*.dat
+                ◄─ api.File:Read  ───  …/Addon/aacs/in/inbox.dat   (written by the uploader)
+                                             │
+Go uploader (Linux, user systemd service + tray)
+  scan every 10 s → hash → skip seen → validate → INSERT raw (bytes unmodified)
+  writes inbox.dat · desktop notifications (D-Bus / notify-send)
+                                             │
+Postgres  raw.*  (immutable)  ──►  rules engine (Python worker)
+                                     ├ parse Lua-table literals (no execution)
+                                     ├ normalize → core.* (sessions, samples, segments)
+                                     ├ labor model, leadership pace, activity stats
+                                     ├ opportunity ranker (labor sinks + activities)
+                                     ├ question generator, check-in scheduler
+                                     └ recommendation evaluators
+                                             │
+Website (FastAPI + htmx, local)   dashboard · check-in chat · activities · leadership · catalog · budget
+                                             │
+LLM router ── local LLM (Ollama) · Claude API (Sonnet 5.5 / Haiku 5.5), hard $ cap
 ```
 
-**Design principles**
+**Principles**
 
-1. **Raw is immutable and everything else can be rebuilt.** The uploader never interprets data. Rules can change, and derived tables are rebuilt from `raw.*`. This lets the addon capture "too much" without regret.
-2. **Run everything locally for the MVP.** Postgres, the worker and the website run under `docker compose` on the gaming PC. The uploader is a native Windows binary. The local LLM is reachable without tunnels. Remote hosting is a later step.
-3. **Few languages.** Go only for the uploader, which must be one standalone binary on Windows. Python for the rules engine and web, because `analyze.py` and `ledger.py` already exist in Python and can be reused directly.
-4. **Read-only addon.** The addon observes and never acts: no automation, no input simulation, no calls to anything that changes game state (see the deny-list in §2.4). This is both a safety rule and a game terms-of-service rule.
-5. **Deterministic first, LLM last.** Numbers, activity classification, question choice and scheduling are rules. The LLM only phrases things, interprets free text and suggests, and every suggestion goes into the recommendation ledger.
+1. **Copy PlayerDBSync's transport rule.** The uploader sends file bytes unmodified and never interprets them. Parsing happens in the DB worker, so any parser fix can be replayed over all history.
+2. **Raw is immutable and everything else can be rebuilt.** That is what makes "capture too much" safe.
+3. **Local-first.** `docker compose` on the gaming PC runs Postgres, the worker and the web app. The uploader is a native Linux binary. Ollama runs locally.
+4. **Read-only addon.** It never calls a function that acts in the game (§2.4).
+5. **Deterministic numbers, LLM for words.** Every LLM suggestion goes through the recommendation ledger.
+6. **Never execute `.dat` content.** The worker parses Lua table literals with a strict grammar-only parser (tables, strings, numbers, booleans, nil). It never runs them in a Lua VM.
 
 ---
 
-## 2. Probe addon spec
+## 2. Probe and capture addon spec
 
-There are two builds from one codebase:
-
-| Build | Purpose | Subscriptions | Polling |
-|---|---|---|---|
-| `aacs_probe` v0.x | Discovery and the event test (Stages 1–2) | All `UI_EVENTS`, wrapped in `pcall` | API introspection and the allow-listed getters |
-| `aacs_capture` v1.x | Daily use (Stage 3+) | Every event that is not marked `unsafe` in the catalog (it still captures widely) | Tiered getters |
+One addon folder, `aacs`, with a `mode` setting in `api.GetSettings("aacs")`: `probe` (event test) or `capture` (daily use).
 
 ### 2.1 Modules
 
 | Module | Responsibility |
 |---|---|
-| `boot` | Loads the config, makes the install ID and session key, writes the header, and catches all errors. |
-| `introspect` | Walks the `api` table (and any other global tables the probe finds) to depth 4 with `pairs`. Records path, Lua type and arity if it can be known. Never calls anything. Output: `M` (manifest) records. |
-| `subscribe` | For each name in `UI_EVENTS` plus E1–E5: `pcall(api.On, name, handler(name))`. Records success, error text, or "accepted silently". Output: `R` (registration) records. |
-| `handler` | A generic varargs handler. It records event name, `select('#', ...)` argument count, and the serialized arguments, and keeps counters per event. |
-| `poller` | Driven by a timer or frame event (to be confirmed, A7). Calls allow-listed getters at tiered rates and emits `S` records **only when a value changes**, plus a full keyframe every 5 min. |
-| `serializer` | A small JSON encoder: depth ≤ 4, strings ≤ 512 chars, ≤ 64 keys per table, cycle-safe, NaN/inf become `null`, functions/userdata become `"<type>"`. |
-| `sampler` | Per-event token bucket. **Counts are always exact.** Payloads are kept in full for the first 200 per event per session, then 1 in N (N adapts to keep the event under 2 records/s). |
-| `writer` | Buffers records and rotates chunks (§3.2). One whole-file write per chunk. |
-| `selfmon` | Records time spent in handlers and the poller (if a clock exists), dropped records, getters disabled after errors, and buffer high-water mark. Output: `K` (health) records each rotation. |
-| `marker` | If a slash command or chat hook exists (unverified), `/aacs mark <text>` writes a `T` (marker) record for the event test. Otherwise the website's marker button takes over (§9.2). |
+| `boot` | Reads settings and `_count.dat` (the last session counter), makes `sess_key`, records the API surface (introspection, §2.5), and wraps everything in `pcall`. |
+| `subscribe` | Calls `pcall(api.On, name, handler(name))` for **every** `UI_EVENTS` value **plus** `CHAT_MESSAGE`, `TEAM_MEMBERS_CHANGED`, `UI_RELOADED` and `UPDATE_PING_INFO`. `UPDATE` is used **only** as the scheduler tick and is never logged. Records success, error or silent acceptance per event. |
+| `handler` | Generic varargs handler: event name, `select('#', ...)`, serialized arguments (depth ≤ 4, string ≤ 512, ≤ 64 keys, cycle-safe), plus counters per event. |
+| `enrich` | When certain events fire, runs follow-up getters (§2.3) so each record carries its context (gold after a sale, bag after an item event). |
+| `poller` | Tiered getters driven by the `UPDATE` dt accumulator. It writes **only changes**, plus a full keyframe every 5 min. |
+| `sampler` | Counts are always exact. Payloads are kept in full for the first 200 per event per session, then 1 in N, with N adapting to keep each event ≤ 2 records/s. |
+| `writer` | Buffers records and rotates chunks (§3). One `api.File:Write` per chunk. Updates `_count.dat`. |
+| `inbox` | Every 30 s, `api.File:Read("aacs/in/inbox.dat")`. When a new `msg_id` appears, it shows a small in-game window with "check-in due" or a one-line suggestion (`api.Interface:CreateWindow`/`CreateWidget`). This is optional; it depends on A27. |
+| `selfmon` | Handler and poller time measured with `Time:GetUiMsec`, dropped records, disabled getters, buffer peak. Emits `K` records. |
+| `marker` | An in-game button on the addon window ("mark: crafting / packs / fishing …") writes `T` records for the event test. No chat commands are needed. |
 
-### 2.2 What gets captured (deliberately wide)
+### 2.2 Event coverage (all 206 + 4, wide by design)
 
-**Events:** every `UI_EVENTS` entry, plus E1–E5, plus any event-like strings introspection finds that are not in `UI_EVENTS` (logged as `candidate`, subscribed in the probe only).
+Every `UI_EVENTS` entry is subscribed. The table only groups them by **what they should tell us**. All of them are unverified until §13.
 
-**Getters, polled in tiers** (names to be confirmed from the `api.lua` manifest):
+| Domain | Events (selection) |
+|---|---|
+| Gold and currencies | `PLAYER_MONEY`, `PLAYER_BANK_MONEY`, `MONEY_ACQUISITION_BY_LOOT`, `PLAYER_HONOR_POINT`, `PLAYER_LIVING_POINT`, `PLAYER_CONTRIBUTION_POINT`, **`PLAYER_LEADERSHIP_POINT`**, `PLAYER_AA_POINT`, `PLAYER_BANK_AA_POINT`, `PLAYER_BM_POINT`, `PLAYER_JURY_POINT`, `RESIDENT_SERVICE_POINT_CHANGED` |
+| Labor | **`LABORPOWER_CHANGED`**, `PREMIUM_LABORPOWER_CHANGED` |
+| Items | `ADDED_ITEM`, `REMOVED_ITEM`, `EXPIRED_ITEM`, `ITEM_ACQUISITION_BY_LOOT`, `BAG_UPDATE`, `BAG_EXPANDED`, `BANK_UPDATE`, `BANK_EXPANDED`, `COFFER_UPDATE`, `LOOT_BAG_CLOSE`, `LOOT_DICE`, `LOOT_PACK_ITEM_BROADCAST`, `ITEM_EQUIP_RESULT`, `UNIT_EQUIPMENT_CHANGED`, `UPDATE_DURABILITY_STATUS` |
+| AH / mail / trade | **`AUCTION_BOUGHT_BY_SOMEONE`**, `AUCTION_BIDDEN`, `MAIL_INBOX_UPDATE`, `MAIL_INBOX_MONEY_TAKEN`, `MAIL_INBOX_ITEM_TAKEN`, `MAIL_INBOX_ATTACHMENT_TAKEN_ALL`, `MAIL_INBOX_TAX_PAID`, `MAIL_RETURNED`, `MAIL_SENT_SUCCESS`, `GOODS_MAIL_INBOX_UPDATE`, **`SELL_SPECIALTY`** (trade pack turn-in) |
+| Crafting / proficiency | `CRAFT_FAILED`, `SPELLCAST_START/STOP/SUCCEEDED`, **`ACTABILITY_EXPERT_CHANGED`**, `ACTABILITY_EXPERT_GRADE_CHANGED`, `ACTABILITY_EXPERT_EXPANDED`, `ABILITY_EXP_CHANGED`, `GRADE_ENCHANT_RESULT`, `ITEM_SMELTING_RESULT`, `ITEM_SOCKETING_RESULT`, `ITEM_ENCHANT_MAGICAL_RESULT` |
+| Gathering / farming / doodads | `INTERACTION_START`, `INTERACTION_END`, `INTERACTION_LIST`, `DOODAD_PHASE_MSG`, `CHAT_MSG_DOODAD`, `SIM_DOODAD_MSG`, `HOUSE_FARM_MSG`, `OPEN_COMMON_FARM_INFO`, `BUILD_AREA_MSG` |
+| Combat / PvP / crime | `UNIT_COMBAT_STATE_CHANGED`, `TARGET_CHANGED`, `TARGET_TO_TARGET_CHANGED`, `TARGET_OVER`, `AGGRO_METER_UPDATED`, `AGGRO_METER_CLEARED`, `EXP_CHANGED`, `HPW_ZONE_STATE_CHANGE`, `SHOW_ACCUMULATE_HONOR_POINT_DURING_HPW`, `INSTANT_GAME_KILL`, **`CRIME_REPORTED`**, `BOT_SUSPECT_REPORTED`, `DIVE_START/END` |
+| Group / leadership / hero | `TEAM_MEMBERS_CHANGED`, `TEAM_ROLE_CHANGED`, `TEAM_MEMBER_DISCONNECTED`, `TEAM_HEALTH_CHANGED`, `TEAM_MANA_CHANGED`, `LOOTING_RULE_*`, `SET_OVERHEAD_MARK`, **`START_HERO_ELECTION_PERIOD`**, **`UPDATE_HERO_ELECTION_CONDITION`**, **`END_HERO_ELECTION_PERIOD`**, **`HERO_SCORE_UPDATED`**, **`HERO_SEASON_UPDATED`** |
+| Session / world | `ENTERED_WORLD`, `LEFT_LOADING`, `LEAVING_WORLD_STARTED`, `LEAVING_WORLD_CANCELED`, `UI_RELOADED`, `ENTERED_LOGIN`, `LEFT_LOGIN`, `FADE_INOUT_DONE`, `OPEN_WORLD_QUEUE`, `DOMINION`, `NATION_TAXRATE`, `TOWER_DEF_MSG` |
+| Fishing / special bars | `DYNAMIC_ACTION_BAR_SHOW`, `DYNAMIC_ACTION_BAR_HIDE`, `DYNAMIC_ACTION_EXECUTE` (fishing likely uses the dynamic action bar; to be verified) |
+| Activity proxies | `MOUSE_DOWN` (**count only**, no coordinates), `TOGGLE_WALK`, `TOGGLE_FOLLOW`, `GLIDER_MOVED_INTO_BAG`, `IME_STATUS_CHANGED` |
+| Chat | `CHAT_MESSAGE` with `CHAT_MESSAGE_FILTERS`. Text is kept for `SYSTEM`, `NOTICE`, `ADDED_ITEM_SELF`, **`SELF_MONEY_CHANGED`**, `SELF_HONOR_POINT_CHANGED`, `SELF_LIVING_POINT_CHANGED`, `SELF_CONTRIBUTION_POINT_CHANGED`, **`SELF_LEADERSHIP_POINT_CHANGED`**, `TRADE_STORE_MSG`, `SELF_SKILL_INFO`, `SELF_STATUS_INFO`, `LOOT_METHOD_CHANGED`, `RAID_COMMAND`, the `COMBAT_*` filters, `HERO_SEASON_UPDATED` and `DOMINION_AND_SIEGE_INFO`. **For other players' chat channels, only the metadata is kept** (channel, sender hash, length). |
+| Everything else | Subscribed and counted. Payloads are sampled. Kept as-is in case later features need them. |
 
-| Tier | Rate | Intended data (if a getter exists) |
+### 2.3 Getter catalog (read-only, all wrapped in `pcall`)
+
+Tiered rates. A getter that errors 3 times in a session is disabled for that session. A getter whose single call takes more than 2 ms moves down a tier.
+
+| Tier | When | Calls |
 |---|---|---|
-| fast | 5 s | gold/money, labor (current/max), combat state, position (x, y, z), zone, target, HP/MP, mounted/gliding state |
-| medium | 30 s | party/raid roster, leader flag, buffs/debuffs, cooldowns, bag-slot hash, honor/vocation/leadership and other currencies, AFK/idle flag |
-| slow | 5 min (and on login) | full inventory and bank (item ID, count, grade), equipment, proficiencies/skills, character name, server, level, faction, guild, house/farm data if exposed |
-| once | login | client/game version, locale, screen/UI scale, addon list |
+| **fast** | every 5 s, change-only | `Bag:GetCurrency()` · `Unit:UnitWorldPosition("player")` · `Unit:GetCurrentZoneGroup()` · `Unit:UnitHealth/UnitMaxHealth/UnitMana/UnitMaxMana("player")` · `Unit:GetUnitId("target")` + `Unit:UnitInfo("target")` + `Unit:UnitDistance("target")` + `Unit:GetFactionName("target")` · `Unit:UnitIsForceAttack("player")` · `Time:GetGameTime()` · `Time:GetUiMsec()` |
+| **medium** | every 30 s | `Unit:UnitBuffCount/UnitBuff("player", i)`, `UnitDeBuffCount/UnitDeBuff` · `Team:IsPartyTeam()`, `Team:IsPartyRaid()`, `Team:GetTeamPlayerIndex()`, `Team:GetTeamDistributorName()` · roster `team1..team50`: `UnitName`, `UnitTeamAuthority`, `UnitIsOffline`, `UnitClass`, `Team:GetRole(i)` · `Bag:CountItems()`, `Bag:Capacity()` · `Map:GetPlayerSextants()` · `Player:GetCrimeInfo()` · `Unit:GetHighAbilityRscInfo()` · `Player:GetGamePoints()` · `Time:GetLocalTime()` |
+| **slow** | every 5 min, on login, and 3 s after a `BAG_UPDATE` burst | full bag scan `Bag:GetBagItemInfo(1, i)` for i = 1..Capacity · `Bank:GetCurrency()`, `Bank:CountItems()`, `Bank:Capacity()`, `Bank:GetLinkText(slot)` for every slot (link text parsed server-side) · `Equipment:GetEquippedItemTooltipInfo(slot)` for every `EQUIP_SLOT` (**`BACKPACK` = trade pack carried**) · `Unit:UnitGearScore/UnitClass/UnitModifierInfo("player")` · `Unit:GetFactionName("player")` · `Player:GetShowingAppellation()` · `X2Util.GetMyMoneyString()` (cross-checks the money unit) |
+| **hourly** | on login and every 60 min | **Pack economics:** `Store:GetSellerShareRatio()`, `Store:GetSpecialtyRatio()`, `Store:GetProductionZoneGroups()`, then per zone `Store:GetSellableZoneGroups(z)` and `Store:GetSpecialtyRatioBetween(a, b)` · `Zone:GetZoneStateInfoByZoneId(z)` for known zones (peace/conflict/war, which matters for ganking) · `Interface:GetScreenWidth/Height/GetUIScale` · `Option:Get*` |
+| **catalog** | Manual "catalog run" button, once per patch, throttled to ≤ 20 calls per frame | **Recipe DB from the game:** `Craft:GetCraftTypesByName(group, category, "")` across all categories, then `GetCraftBaseInfo`, `GetCraftMaterialInfo` and `GetCraftProductInfo` per craft ID · `Item:GetItemInfoByType(id)` for every item ID seen (cached) · `Skill:GetSkillTooltip`, `Ability:GetBuffTooltip` for every skill/buff ID seen · `Ability:GetAbilityFromView(i)` + `IsActiveAbility` · `Equipment:GetEquippedSkillsetLunagems("player")` |
+| **on event** | after the trigger | `AUCTION_BOUGHT_BY_SOMEONE`, `SELL_SPECIALTY`, `MAIL_INBOX_MONEY_TAKEN`, `MONEY_ACQUISITION_BY_LOOT` → `Bag:GetCurrency()` right away · `ADDED_ITEM`/`REMOVED_ITEM` → bag rescan, debounced 3 s · `TARGET_CHANGED` → target block · `TEAM_MEMBERS_CHANGED` → roster · `UNIT_EQUIPMENT_CHANGED`/`ITEM_EQUIP_RESULT` → equipment scan (pack on/off) · `ENTERED_WORLD`/`LEFT_LOADING` → slow + hourly tiers |
 
-**Chat:** keep the metadata (channel, sender hash, length) for every message. Keep the text **only** for system, loot, trade/AH, mail and your own messages. Other players' text is personal data and stays off by default (a config flag can change this).
+### 2.4 Hard deny-list (these functions act in the game, so never called)
 
-### 2.3 Getter allow-list rules (how "capture everything" stays safe)
+`Team:InviteToTeam`, `Team:SetRole`, `Team:MoveTeamMember`, `Bag:EquipBagItem`, `Cursor:ClearCursor`, `Cursor:SetCursorImage`, `Player:ChangeAppellation`, `Option:Set*` (all three), `Chat:DispatchChatMessage`, `Chat:ExpressEmotion`, `Map:ToggleMapWithPortal`, **`Unit:TargetUnit`** (its doc says "gets" but it takes a unit argument and may change the target, so it stays denied until proven harmless), `ADDON.ShowContent`, `ADDON.RegisterContent*` for game windows, `api:Emit` (only `ADDON_AACS_*` names), `api.Log:*` (debug build only, so chat isn't spammed), and `api.SaveSettings()` (only on `LEAVING_WORLD_STARTED` and at most every 10 min; the doc says "do not call too often").
 
-- Only zero-argument functions whose names match `^(Get|Is|Has|Can|Count|Find|Query)` qualify, plus explicit additions after review.
-- Every call is wrapped in `pcall`. Three errors in one session disable that getter for the session and log it as `getter_disabled`.
-- A getter whose single call takes more than 2 ms is moved to the slow tier.
-- The allow-list ships as data in the addon config, generated from the probe manifest and the Stage 2 results. No getter is called before it has been seen in the manifest.
+### 2.5 API-surface introspection (every login)
 
-### 2.4 Hard deny-list (never called by either build)
-
-Names containing `Set|Use|Send|Buy|Sell|Bid|Craft|Make|Move|Cast|Request|Delete|Destroy|Drop|Equip|Unequip|Accept|Decline|Invite|Kick|Post|Mail|Trade|Open|Close|Click|Press|Toggle|Start|Stop|Reload|Logout|Quit`, and anything not on the allow-list.
-
-### 2.5 Config (per install, in the addon folder)
-
-`install_id`, `capture_level` (`probe|full|lean`), the tier rates, the sampler thresholds, the chat policy, and the allow-list/deny-list versions. The config's version is written into every chunk header.
+`pairs()` over `api` and its sub-tables to depth 2 records name and type (no calls). **This matters because `Quest`, `ItemEnchant`, `Map`, `Zone` and `Craft` are documented with functions but are missing from the `ADDON_API = {...}` declaration.** The manifest shows whether they exist at runtime. Other oddities to confirm: `api.On` uses a dot but `api:DoIn` and `api:Emit` use a colon, and the method is named `Team:IsPartyRaid`.
 
 ---
 
 ## 3. Chunk format and versioning
 
-### 3.1 File layout
+### 3.1 Files (matching the PlayerDB convention)
 
 ```
-~/Documents/AAClassic/Addon/aacs/out/
-  aacs_<fmtMajor>_<install8>_<sessKey>_<seq6>.jsonl     ← written once, never modified
-~/Documents/AAClassic/Addon/aacs/archive/YYYY-MM-DD/     ← moved here by the uploader after a successful insert
-~/Documents/AAClassic/Addon/aacs/quarantine/              ← bad footer, unknown major version, parse error
+Addon/aacs/
+  main.lua …                        (code: changed only while the game is closed)
+  out/_count.dat                    { addon_version="…", sess_counter=N, last_sess="…", last_seq=M }
+  out/<sessKey>_<seq6>.dat          write-once chunk
+  in/inbox.dat                      written by the uploader, read by the addon (optional)
 ```
 
-- `sessKey` is a login timestamp if the addon has a clock (A6). Otherwise it is a counter kept in saved settings, plus random hex.
-- `seq` is a per-session counter starting at 0. A gap in it means data was lost, and the uploader reports it.
+- `sessKey` = `Time:GetLocalTime()` formatted `YYYYMMDDhhmmss` + `sess_counter`.
+- Write-once names mean a file never changes after it is written. The uploader can treat a stable name + hash as done.
+- **Cleanup:** the uploader removes `out/*.dat` files older than 14 days **only while the game process is not running** (detected under Proton). That respects "no modifying while the game runs" for anything the addon owns.
 
 ### 3.2 Rotation
 
-A chunk is closed at whichever comes first: **60 s**, **500 records**, or **256 KB**, or on a logout/reload/zone event if one is verified (A18). Worst-case loss on a crash is one interval (≤ 60 s).
+A chunk is closed at whichever comes first: **60 s**, **500 records**, or about **256 KB** estimated size, or on `LEAVING_WORLD_STARTED` / `UI_RELOADED` (if verified, A18/A19). Worst-case loss on a crash is one interval.
 
-### 3.3 Record types (JSON Lines, UTF-8, LF)
+### 3.3 Chunk table (what `api.File:Write` serializes)
 
-| `t` | Name | Key fields |
+```lua
+{
+  addon_version = "1.0.0",            -- same key PlayerDB uses
+  fmt = "1.0",
+  hdr = { build="capture", install="…", sess="…", seq=12, mode="capture",
+          clk = { ui_ms0=…, local_time={…}, game_time={…} },
+          cfg_ver=3, events_hash="…", getters_ver=2, char={ name=…, faction=… } },
+  rec = {                              -- array, in order
+    { t="E", ms=123456, ev="LABORPOWER_CHANGED", n=2, a={ … }, s=1 },
+    { t="S", ms=123460, k="Bag:GetCurrency", v=1234567, kf=false },
+    { t="C", counts={ BAG_UPDATE=14, … } },
+    { t="T", ms=…, text="crafting" },
+    …
+  },
+  ftr = { n=37, last_ms=…, closed="rotate" },
+}
+```
+
+| `t` | Meaning |
+|---|---|
+| `M` | manifest entry (introspection) |
+| `R` | registration result per event |
+| `E` | event (`ev`, `n`, `a`, `s` = sampling weight) |
+| `S` | getter snapshot (`k`, `v`, `kf` = keyframe) |
+| `C` | exact per-event counters since the last chunk |
+| `T` | marker |
+| `K` | health |
+| `X` | error (`where`, `msg`) |
+
+**A chunk is valid** if it parses as a Lua table literal, has `hdr` and `ftr`, and `#rec == ftr.n`. The uploader does **not** validate; it only ships bytes. The worker validates and records `parse_status` (ok / partial / bad) per chunk. If a file can't be read (the game is mid-write), the uploader retries on the next scan, as PlayerDBSync does.
+
+### 3.4 Versioning
+
+| Thing | Scheme | Rule |
 |---|---|---|
-| `H` | header (line 1, always) | `fmt` "1.0", `addon` semver, `build` (probe/capture), `install`, `sess`, `seq`, `clk` {src, t0_wall, t0_mono}, `cfg_ver`, `events_hash` (hash of the subscribed set), `allow_ver`, `char` (if known), `game_ver` (if known) |
-| `M` | manifest | `path`, `ltype`, `arity?`, `src` (introspect/ui_events/comment) |
-| `R` | registration result | `ev`, `ok`, `err?`, `mode` (accepted/error/silent) |
-| `E` | event | `i` (index in chunk), `ms` (since session start), `ev`, `n` (argument count), `a` (serialized arguments), `s` (sampling weight; 1 = not sampled) |
-| `C` | counters | per-event exact counts since the last chunk, including suppressed payloads |
-| `S` | snapshot | `ms`, `k` (getter path), `v` (value), `kf` (true = keyframe) |
-| `T` | marker | `ms`, `text`, `src` (addon/website) |
-| `K` | health | handler time, poller time, dropped records, disabled getters, buffer peak |
-| `X` | error | `ms`, `where`, `msg` (truncated) |
-| `F` | footer (last line, always) | `n` (record count excluding H/F), `bytes` (byte length of lines 2..n+1), `closed` (rotate/logout/reload/size/count), `hash?` (FNV-1a 32 if bit operations are available) |
-
-**A chunk is valid only if** it has an `H` first line and an `F` last line, and the footer's `n`/`bytes` match. The uploader ignores files younger than 5 s, or with an mtime that changed in the last 2 s, so it never reads a half-written file.
-
-### 3.4 Versioning rules
-
-| Thing | Scheme | Compatibility rule |
-|---|---|---|
-| Chunk format `fmt` | MAJOR.MINOR | **Minor**: new record types or fields only. Older ingest stores unknown fields raw. **Major**: breaking change. The uploader quarantines unknown majors and the website shows a warning. |
-| Addon `addon` | semver | Free to change. Recorded per chunk so data quality can be traced to a build. |
-| Subscribed set `events_hash` | hash of the sorted event names | Separates "event never fired" from "event wasn't subscribed". |
-| Allow-list `allow_ver` | integer | Same purpose, for getters. |
-| Rules `rule_id@version` | per rule | Stored on every derived row, so rule changes are auditable and rebuilt deliberately. |
-| DB schema | numbered migrations | Raw tables are append-only. Derived tables may be dropped and rebuilt. |
+| `fmt` | MAJOR.MINOR | Minor: new fields or record types, which older parsers keep raw. Major: the worker parks the chunks as `unsupported_fmt` until a parser exists. They are never lost, since raw bytes are kept. |
+| `addon_version` | semver | Stored per chunk |
+| `events_hash` | hash of the subscribed names | Separates "never fired" from "not subscribed" |
+| `getters_ver` | integer | Same purpose, for getters |
+| Rules | `rule_id@version` on every derived row | Rebuilt on purpose |
+| DB | numbered migrations | Raw is append-only |
+| **Game patch** | `game_patch` fact (date) | A patch triggers a new event test (short form) and a new catalog run |
 
 ---
 
-## 4. Go uploader
+## 4. Go uploader (Linux)
 
 | Concern | Behavior |
 |---|---|
-| Discovery | fsnotify on `out/`, plus a 10 s polling fallback (OneDrive-redirected Documents folders sometimes drop notifications). Finds `Documents` through the Windows known-folder API, not a hard-coded path. |
-| Validation | Header and footer present, `n`/`bytes` match, `fmt` major supported. Any failure goes to `quarantine/` with a `.reason` file. |
-| Idempotency | SHA-256 of the file is the idempotency key. Insert into `raw.chunk` with `ON CONFLICT (sha256) DO NOTHING`, plus a unique key on (install, sess, seq). One transaction per chunk inserts the chunk and its records. The file moves to `archive/` only after commit. |
-| Crash safety | A kill at any point leaves the file in `out/` or already committed. Re-processing is a no-op. |
-| Offline | If Postgres is down, back off (2 s → 5 min). Files simply stay in `out/`. |
-| Retention | Keep archives 14 days (configurable). Keep quarantine until the user clears it. |
-| Own stream | The uploader writes its own records too: uploader start/stop, gaps found, and **website markers** (§9.2). These go into `raw.chunk` with `build='uploader'`. |
-| Notification bridge | Polls `assistant.checkin` for due check-ins and shows a Windows toast that opens the website. This works even when the game is full-screen. |
-| DB rights | Uses the `aacs_ingest` role: INSERT on `raw.*` and SELECT on `assistant.checkin` only. |
-| Observability | Local log file. `/healthz` on localhost reports last upload, backlog and quarantine count. |
+| Path | Default `~/.local/share/AAClassic/steam-compatdata/pfx/drive_c/users/steamuser/Documents/AAClassic/Addon/aacs/`, configurable, with auto-detect of the PlayerDBSync-style Wine paths. |
+| Scan | Every 10 s (inotify is unreliable across Proton). Files whose size and mtime match a known record are skipped. Otherwise: read with a shared open, SHA-256, skip if the hash is known, retry later on an I/O error. |
+| Insert | `raw.chunk` with `ON CONFLICT (sha256) DO NOTHING`. Stores **bytes unmodified** (`bytea`) and the file metadata. **No parsing.** |
+| Batching | Up to 200 files per transaction when catching up |
+| Offline | Back off from 2 s to 5 min. Files stay where they are. |
+| Inbox writer | Writes `in/inbox.dat` (`{ msg_id=…, kind="checkin_due" \| "note", text="…", expires=… }`) **atomically**: write a temp file, then rename (fine while the game runs; PlayerDBSync does the same with `ignore.dat`). |
+| Notifications | Desktop notification through D-Bus (`notify-send`) for due check-ins. It opens the website. |
+| Game detection | Process scan for the game executable under Proton. Used for cleanup timing and session hints. |
+| Run as | `systemd --user` service, plus an optional tray icon |
+| DB role | `aacs_ingest`: INSERT on `raw.*`, SELECT on `assistant.checkin` |
+| Health | `localhost:7781/healthz` reports last file, backlog, and parse failures reported back by the worker |
 
 ---
 
 ## 5. Database schema (Postgres 16)
 
-Names and columns only; types are indicative.
-
-### 5.1 `raw` (append-only)
+### 5.1 `raw`
 
 | Table | Columns |
 |---|---|
-| `raw.chunk` | `chunk_id` bigserial PK · `install_id` text · `sess_key` text · `seq` int · `build` text · `fmt` text · `addon_ver` text · `cfg_ver` int · `events_hash` text · `allow_ver` int · `sha256` bytea UNIQUE · `n_records` int · `closed_reason` text · `file_mtime` timestamptz · `received_at` timestamptz · `header` jsonb · UNIQUE(`install_id`,`sess_key`,`seq`,`build`) |
-| `raw.record` | `chunk_id` FK · `idx` int · `t` char(1) · `ms` bigint · `ts_est` timestamptz (estimated wall time) · `ev` text NULL · `k` text NULL · `payload` jsonb · PK(`chunk_id`,`idx`) · **partitioned by month on `ts_est`** · indexes (`ev`,`ts_est`), (`k`,`ts_est`) |
-| `raw.quarantine_log` | `file_name`, `reason`, `seen_at`, `header` jsonb NULL |
+| `raw.chunk` | `chunk_id` PK · `file_name` · `sha256` UNIQUE · `bytes` bytea · `size` · `mtime` · `received_at` · `parse_status` {pending, ok, partial, bad, unsupported_fmt} · `parse_error` · `addon_version` · `fmt` · `sess_key` · `seq` · `hdr` jsonb · UNIQUE(`sess_key`,`seq`) where parsed |
+| `raw.record` | `chunk_id` · `idx` · `t` · `ms` · `ts_est` timestamptz · `ev` · `k` · `payload` jsonb · PK(`chunk_id`,`idx`) · partitioned by month · indexes on (`ev`,`ts_est`) and (`k`,`ts_est`) |
 
-### 5.2 `catalog` (what the game exposes and what is verified)
+`ts_est` = session wall start (from `hdr.clk.local_time`, converted with the PC's time zone) + (`ms` − `ui_ms0`). It is checked against the file mtime (A6).
+
+### 5.2 `catalog`
 
 | Table | Columns |
 |---|---|
-| `catalog.event` | `name` PK · `source` {comment_E1_5, ui_events, introspect_candidate} · **`status`** {unverified, registered, register_error, fired, verified, dead, unsafe} · `first_registered_at` · `first_fired_at` · `fire_count` · `rate_p95_per_min` · `arg_shape` jsonb (inferred types per position) · `sample_payloads` jsonb (≤ 5) · `verified_by` (event-test ID + marker) · `notes` |
-| `catalog.api_fn` | `path` PK · `ltype` · `status` {listed, allowlisted, called_ok, errors, slow, denied} · `sample_value` jsonb · `avg_call_ms` · `notes` |
-| `catalog.event_test` | `test_id` PK · `addon_ver` · `started_at` · `script_ver` · `results` jsonb (assumption ID → pass/fail/unknown + evidence) |
-| `catalog.semantic_map` | `concept` (e.g. `gold`, `labor`, `leadership`, `craft_done`, `ah_sale`) · `source_kind` {event, getter, derived, manual} · `source_ref` · `transform` · `verified` bool · `since_addon_ver` — **the only bridge between game data and rules**. Rules depend on concepts, never directly on event names. |
+| `catalog.event` | `name` PK · `documented_in` {api_on_comment, ui_events} · `status` {unverified, registered, register_error, fired, verified, dead, unsafe} · `first_fired_at` · `fire_count` · `rate_p95_per_min` · `arg_shape` jsonb · `samples` jsonb (≤ 5) · `verified_by` · `notes` |
+| `catalog.api_fn` | `path` PK · `exists_runtime` · `status` {listed, allowlisted, called_ok, errors, slow, denied} · `avg_ms` · `sample` jsonb |
+| `catalog.chat_filter` | `filter` PK · `id_value` · `status` · `parse_pattern` (regex for the client locale) · `samples` |
+| `catalog.semantic_map` | `concept` (gold, bank_gold, labor, leadership, honor, craft_done, ah_sold, pack_sold, coinpurse_opened, kill_player, death, …) · `source_kind` {event, getter, chat_filter, derived, manual} · `source_ref` · `transform` · `verified` · `since_addon_version`. **Rules depend on concepts only.** |
+| `catalog.event_test` | `test_id` · `addon_version` · `script_ver` · `results` jsonb (A-id → verdict + evidence) |
 
 ### 5.3 `core` (derived and rebuildable)
 
 | Table | Columns |
 |---|---|
-| `core.character` | `char_id` PK · `name` · `server` · `faction` · `install_id` |
-| `core.play_session` | `session_id` PK · `char_id` · `started_at` · `ended_at` · `end_reason` {logout, gap, crash} · `active_s` · `afk_s` · `chunk_from`/`chunk_to` · `seq_gaps` int |
-| `core.sample` | `char_id` · `ts` · `concept` (gold, labor, labor_max, leadership, honor, …) · `value` numeric · `src_record` (chunk_id, idx) · PK(`char_id`,`concept`,`ts`) |
-| `core.inventory_snapshot` | `char_id` · `ts` · `items` jsonb (item_id → count) · `value_gold_est` numeric (at the price basis of §7.1) |
-| `core.activity_segment` | `seg_id` PK · `session_id` · `start_ts` · `end_ts` · `activity` · `confidence` 0–1 · `rule_id` · `rule_ver` · `evidence` jsonb · `label_source` {rule, user, user_confirmed_llm} · `gold_delta` · `labor_delta` · `leadership_delta` |
-| `core.group_state` | `char_id` · `ts` · `in_party` · `in_raid` · `is_leader` · `member_count` |
-| `core.derive_run` | `run_id` · `started_at` · `rules_hash` · `from_ts`/`to_ts` · `status` (for audit and deterministic rebuild checks) |
+| `core.character` | `char_id` · `name` · `server` · `faction` |
+| `core.play_session` | `session_id` · `char_id` · `started_at` · `ended_at` · `end_reason` · `active_s` · `afk_s` · `seq_gaps` |
+| `core.sample` | `char_id` · `ts` · `concept` · `value` numeric · `src` (chunk, idx) · PK(`char_id`,`concept`,`ts`) |
+| `core.labor_state` | `char_id` · `ts` · `labor_observed` NULL · `labor_model` · `confidence` · `to_cap_minutes` · `wasted_since_last` (§6.4) |
+| `core.inventory_snapshot` | `char_id` · `ts` · `where` {bag, bank, equipped} · `items` jsonb · `value_est_g` |
+| `core.activity_segment` | `seg_id` · `session_id` · `start_ts` · `end_ts` · `activity` · `sub` (route, zone, target type) · `confidence` · `rule_id@ver` · `evidence` jsonb · `label_source` {rule, classifier, user} · `gold_delta_c` (copper) · `item_value_delta_c` · `labor_spent` · `leadership_delta` · `honor_delta` · `deaths` · `context` jsonb (real hour, in-game hour, weekday, party size, zone state) |
+| `core.group_state` | `char_id` · `ts` · `team_type` {solo, party, raid} · `is_leader` · `size` |
 
-### 5.4 `knowledge` (game data the user supplies, §11)
-
-| Table | Columns |
-|---|---|
-| `knowledge.item` | `item_id` PK · `name` · `norm_name` · `tradeable` |
-| `knowledge.recipe` / `recipe_material` | Taken from `recipes.csv`: `craft_id`, `output_item`, `output_amount`, `req_labor`; materials (`name`, `amount`). "Coin" is the craft fee. |
-| `knowledge.price_week` | `week_of` (Monday) · `item_id` · `p24`/`v24`/`p7`/`v7`/`p30`/`v30` · `source_file` · `last_updated_at` |
-| `knowledge.harvest_zone` | Taken from the plants-by-zone CSV |
-| `knowledge.fact` | `key` · `value` jsonb · `source` {user_answer, doc, observed} · `valid_until` · `confidence` (e.g. labor regen rates, leadership rules, reset times) |
-
-### 5.5 `econ` (the Excel ledger becomes tables)
-
-| Table | Columns (mirrors `ledger.py`) |
-|---|---|
-| `econ.proficiency` | `char_id`, `skill`, `value`, `as_of`, `source` |
-| `econ.recipe_requirement` | `recipe`, `skill`, `required`, `learned_at` |
-| `econ.exclusion` | `recipe`, `reason`, `date`, `until` NULL |
-| `econ.learning` | `date`, `text`, `tags` (replaces `learnings.md`) |
-| `econ.plan` | `plan_id` · `plan_date` · `char_id` · `inputs` jsonb (labor, gold, volume_cap, min_volume, labor_value) · `prices_week` · `analyzer_ver` · `projected_profit` |
-| `econ.plan_line` | `plan_id` · `recipe` · `batches` · `units_listed` · `proj_sell_price` · `proj_mat_cost` · `proj_labor` · `proj_profit` · `spl` · fill-ins: `crafted`, `date_crafted`, `date_sold`, `actual_price`, `qty_sold`, `times_listed`, `actual_labor`, `notes` · `fill_source` per field {user, observed, observed_confirmed} |
-| `econ.sale` | `sale_id` · `char_id` · `ts` · `item_id` · `qty` · `unit_price` · `fee` · `source` {observed_event, user} · `plan_line_id` NULL |
-| `econ.purchase` | Same shape. Lets realized profit use the **actual** material cost rather than the projected cost (an improvement over `ledger.py`). |
-| `econ.gathering_trip` | `date`, `material`, `zone`, `amount`, `labor`, `minutes`, `gold`, `notes`, `segment_id` NULL |
-| `econ.ledger_day` (view) | `date`, `projected`, `realized`, `delta`, `cumulative`, `notes`, **`realized_status`** {unreported, partial, complete}. Never invents realized numbers. |
-
-### 5.6 `assistant`
+### 5.4 `knowledge`
 
 | Table | Columns |
 |---|---|
-| `assistant.checkin` | `checkin_id` · `session_id` · `due_at` · `notified_at` · `opened_at` · `closed_at` · `status` {due, deferred, notified, open, closed, skipped, missed} · `defer_reason` · `packet` jsonb (the deterministic summary) · `summary` text (written at close) |
-| `assistant.message` | `msg_id` · `checkin_id` · `role` {system_note, assistant, user} · `content` · `llm_call_id` NULL · `ts` |
-| `assistant.question` | `q_id` · `topic_key` (dedupe key) · `kind` {ledger_fillin, classify_segment, fact, preference, data_gap} · `priority` P0–P3 · `value_score` · `gold_at_stake` · `status` {candidate, queued, asked, answered, skipped, expired, suppressed, auto_resolved} · `asked_in` checkin · `answer` jsonb · `creates_fact` key NULL · `skip_count` · `cooldown_until` · `created_by_rule` |
-| `assistant.recommendation` | See §8 |
-| `assistant.rec_event` | `rec_id` · `ts` · `from_status` → `to_status` · `actor` {system, user, llm} · `note` |
-| `assistant.llm_call` | `call_id` · `ts` · `purpose` {checkin_open, checkin_turn, parse_answer, daily_plan, weekly_review, classify_help} · `provider` {anthropic, local} · `model` · `in_tokens` · `cache_read` · `cache_write` · `out_tokens` · `cost_usd` · `checkin_id` NULL · `degraded` bool |
-| `assistant.budget_month` | `month` · `cap_usd` (9.00) · `spent_usd` · `projected_usd` · `mode` {normal, conserve, local_only} |
+| `knowledge.item` | `item_id` · `name` · `info` jsonb (from `GetItemInfoByType`) · `tradeable` |
+| `knowledge.recipe` / `recipe_material` / `recipe_product` | From the **in-game catalog run** (source=`game`), with `recipes.csv` as a fallback (source=`csv`) |
+| `knowledge.price_week` | Weekly AH CSV, as before |
+| `knowledge.price_observed` | Your own AH sales and purchases (item, unit price, ts). Better than the weekly sheet for items you trade. |
+| `knowledge.pack_ratio` | `ts` · `from_zone` · `to_zone` · `ratio` · `seller_share` (hourly `Store:*` snapshots) |
+| `knowledge.zone_state` | `ts` · `zone_id` · `state` jsonb |
+| `knowledge.schedule_event` | `name` · `kind` {world_boss, daily_event, game_time_event} · `rule` (cron/real time or game time) · `source` (aa-classic.com/timers) · **`dst_correction_h`** (+1 for the "world bosses" and "daily events" headers in winter, 0 for game-time events) |
+| `knowledge.fact` | `key` · `value` jsonb · `source` {user, doc, observed} · `valid_until` · `confidence`. Seeded with: `labor.regen_per_5min=40` (online and offline), `labor.cap=10000`, `money.units` (1 g = 100 s, 1 s = 100 c; Coin = 1 c), `reset.daily_utc≈04:00` (confirm), `game_time.cycle_real_h=4`, `leadership.hero_target=4000`, `leadership.hero_reward_g=90000` (+ a 1-month ring) |
+
+### 5.5 `econ`
+
+| Table | Columns |
+|---|---|
+| `econ.proficiency` | `char_id` · `skill` · `value` · `as_of` · `source` (observed `ACTABILITY_EXPERT_CHANGED` or user) |
+| `econ.exclusion` | `subject` (recipe/activity/route) · `reason` · `until` |
+| `econ.transaction` | `tx_id` · `char_id` · `ts` · `kind` {ah_sale, ah_buy, mail_money, loot_money, pack_sale, vendor, tax, fee, unknown} · `item_id` · `qty` · `amount_c` · `source_record` · `segment_id` |
+| `econ.activity_stats` | `activity` · `sub` · `context_bucket` · `n_segments` · `hours` · `gold_per_h_c` (mean, p25, p75) · `labor_per_h` · `silver_per_labor` · `leadership_per_h` · `honor_per_h` · `death_rate_h` · `updated_at` (§7.2) |
+| `econ.labor_sink` | Ranked options: `option` (recipe / coinpurse type / pack route / gather node) · `silver_per_labor` · `silver_per_min` · `max_units_today` (volume cap) · `requires` · `basis` {observed, priced, mixed} |
+
+### 5.6 `leadership`
+
+| Table | Columns |
+|---|---|
+| `leadership.period` | `period_id` · `start_at` · `end_at` (from `START/END_HERO_ELECTION_PERIOD` and `HERO_SEASON_UPDATED`, else user) · `mode` {election, hero, off} · `target` (4000 in hero mode) · `reward_g` (90,000) |
+| `leadership.progress` | `period_id` · `ts` · `points` · `rank` NULL (`HERO_SCORE_UPDATED` if it carries one) · `pace_needed_per_day` · `projected_end` · `p_reach_target` |
+| `leadership.source` | `method` (from your upcoming list) · `observed_per_h` · `n` · `notes` |
+
+### 5.7 `assistant`
+
+Same as v1: `checkin`, `message`, `question`, `recommendation`, `rec_event`, `llm_call`, `budget_month` (see §8–§10, §12). Added: `checkin.inbox_msg_id` (if in-game notification was used).
 
 ---
 
 ## 6. Activity rules (time tracking)
 
-### 6.1 Taxonomy (MVP)
+### 6.1 Taxonomy
 
-`crafting`, `gathering` (wild harvest/mining/logging), `farming` (plant/harvest your own land), `trade_run` (packs), `fishing`, `combat_pve`, `combat_pvp`, `group_content` (party/raid activity, the leadership basis), `market` (AH/mail/vendor), `travel`, `idle_social` (in town, chatting), `afk`, `unknown`.
+`crafting` · `pack_run` (craft, carry, sell) · `fishing` · `gathering` · `farming` (own land) · `mob_farming` · **`larceny`** (opening coin purses with labor; see note) · `ganking` / `pvp` · `group_content` (party/raid; overlays other activities) · `market` (AH/mail/vendor) · `travel` · `idle_social` · `afk` · `dead` · `unknown`.
 
-Every second of a play session gets **exactly one** activity. `unknown` is allowed, and its share is the main data-quality KPI.
+*Note: my understanding is that larceny = opening coin purses dropped by mobs, which costs labor and trains the Larceny proficiency. Please confirm (§11).*
 
-### 6.2 Rule definition (stored as data, versioned)
+### 6.2 Activity fingerprints (starting rules)
 
-| Field | Meaning |
-|---|---|
-| `rule_id`, `version` | e.g. `craft.labor_drop@3` |
-| `requires` | List of `catalog.semantic_map` concepts. **The rule is inactive until every required concept is `verified`.** |
-| `window` | Sliding window (e.g. 30 s) |
-| `when` | A declarative condition over concepts (e.g. `labor_delta < 0 AND inventory_gain(crafted_output)`) |
-| `emits` | Activity, confidence, and the evidence fields to keep |
-| `precedence` | Integer that settles overlaps |
-| `min_duration` | Segments shorter than this merge into neighbors |
+Each rule only becomes active once all its concepts are verified (§13).
 
-### 6.3 Starting rule set (the concepts each rule needs are what the event test must confirm)
+| Activity | Fingerprint (window 30–120 s) | Conf. |
+|---|---|---|
+| crafting | Repeated `SPELLCAST_START/SUCCEEDED` while stationary + `LABORPOWER_CHANGED` drops matching the recipe labor (after proficiency) + `ADDED_ITEM` of a recipe product + `REMOVED_ITEM` of materials + `ACTABILITY_EXPERT_CHANGED` | 0.9 |
+| pack_run | `BACKPACK` slot holds a specialty pack (equipment scan) + movement across zone groups → ends with `SELL_SPECIALTY` + gold up. The pack-crafting step before it is linked by labor drop + pack item. | 0.9 |
+| fishing | `DYNAMIC_ACTION_BAR_SHOW/EXECUTE` + fishing buffs + stationary on water + `ADDED_ITEM` of fish | 0.8 |
+| gathering | `INTERACTION_START/END` + `DOODAD_PHASE_MSG`/`CHAT_MSG_DOODAD` + small labor drops + raw-material gains, away from your own land | 0.8 |
+| farming | Same as gathering, near a known plot and/or `HOUSE_FARM_MSG` | 0.75 |
+| mob_farming | Combat with NPC targets (`UnitInfo`) + `EXP_CHANGED` + `MONEY/ITEM_ACQUISITION_BY_LOOT`, `LOOT_BAG_CLOSE`, coin-purse items gained | 0.85 |
+| larceny | Coin-purse `REMOVED_ITEM` + labor drop + gold/items gained, stationary, Larceny proficiency change | 0.9 |
+| ganking / pvp | Combat with **player** targets of a hostile faction (`UnitInfo`, `GetFactionName`), `UnitIsForceAttack`, `PLAYER_HONOR_POINT` up, combat chat filters, conflict/war `zone_state`. Picking up an enemy pack then `SELL_SPECIALTY` = **ganking profit**. | 0.8 |
+| group_content | `IsPartyRaid`/`IsPartyTeam`, size ≥ N, `UnitTeamAuthority("player")` (leader?), `PLAYER_LEADERSHIP_POINT` / `SELF_LEADERSHIP_POINT_CHANGED` | 0.9 |
+| market | `MAIL_*`, `AUCTION_*`, NPC interaction events, gold change without labor | 0.9 |
+| travel | Position change with nothing else matching. Gliding and mounts from buffs and `GLIDER_MOVED_INTO_BAG`. | 0.6 |
+| afk | No position change, `MOUSE_DOWN` count 0, no combat, for ≥ 5 min (backdated) | 0.9 |
+| dead | HP 0 until resurrection | 1.0 |
+| fallback | `unknown`, which becomes a question candidate if > 10 min | — |
 
-| Rule | Needs | Logic (sketch) | Conf. |
-|---|---|---|---|
-| `session.bounds` | any record | A session starts at the first chunk. It ends at a logout record **or** after a > 10 min gap in records. | 1.0 |
-| `afk.no_change` | position, combat_state, any input-ish events | No position change, no combat, no non-periodic events for ≥ 5 min. The segment is backdated to the last activity. | 0.9 |
-| `craft.labor_drop` | labor, inventory/craft event | Labor drops in steps matching `req_labor` (after proficiency discount) and an output item appears | 0.9 |
-| `craft.event` | craft_done (if one exists) | A direct event | 1.0 |
-| `gather.labor_drop` | labor, inventory, position | Small labor drops plus gains of raw materials found in `harvest_zone` or in no recipe output | 0.75 |
-| `farm.own_land` | labor, position, house/farm data | Labor spent within the radius of a known plot | 0.7 |
-| `trade_run.pack` | backpack slot/buff, position | Pack equipped plus movement, ending at a trade outlet | 0.8 |
-| `fish.*` | buffs/skills, inventory | Fish items gained, stationary on water | 0.7 |
-| `combat.*` | combat_state, target, faction | In combat. PvP if the target is a player of the hostile faction. | 0.85 |
-| `group.content` | group_state | In a raid or party with ≥ N members for more than 50% of the window | 0.9 |
-| `market.ah_mail` | AH/mail open events or gold changes without labor | Window open, or a sale/purchase observed | 0.9 |
-| `travel.move` | position | Distance > threshold and nothing above applies | 0.6 |
-| fallback | — | `unknown`, which becomes a question candidate if > 10 min (§7.2) | — |
+**Precedence:** explicit event > `dead` > `afk` > `pack_run` (carrying a pack dominates) > `ganking/pvp` > `larceny` > `crafting` > `fishing` > `gathering`/`farming` > `mob_farming` > `market` > `travel` > `idle_social` > `unknown`. `group_content` is an **overlay tag** on top of the primary activity.
 
-**Precedence:** explicit event > `afk` > `group_content` (it overlays other activities: a raid while gathering counts as group_content with a secondary tag) > `crafting` > `trade_run` > `gathering`/`farming`/`fishing` > `combat` > `market` > `travel` > `idle_social` > `unknown`.
+### 6.3 Learning what activities look like
 
-**User labels win.** A user label for a segment overrides the rule, and the pair (rule output, user label) is stored as a training example for tuning thresholds.
+1. **Rules first** (the table above).
+2. **Labels:** check-in answers and website corrections become `label_source=user` segments.
+3. **Classifier (after ≥ 30 labeled segments per activity):** a small gradient-boosted model on window features (event counts per type, labor slope, gold slope, movement speed, target type, zone state, party size, buffs present). It is used **only** where it beats the rules on a held-out week, and its suggestions always carry confidence. There is no LLM in classification, which keeps it cheap and deterministic.
 
-### 6.4 Derived metrics
+### 6.4 Labor model (central to profit)
 
-- **Time:** active hours per day and week, per activity, AFK share, longest session, labor-capped time.
-- **Labor efficiency:** labor used vs regenerated. The **labor cap waste** alert fires when labor stays at its maximum for longer than X min, since that labor is lost value. This needs the labor regen facts from §11.
-- **Gold:** cash Δ per session and segment (gold samples), **silver per active hour by activity**, and net-worth Δ (cash plus inventory valued at the conservative sell price).
-- **Leadership:** leadership samples give Δ per segment and **leadership per hour** of group_content. If the leader flag can be read, also leader time vs member time. If leadership cannot be read (A11 fails), the value is asked for once per session through the question budget, and Δ is spread over that session's group_content time (marked `estimated`).
+- **Facts:** regen 40 labor per 5 min = **8 per minute = 480 per hour = 11,520 per day**, online and offline. Cap 10,000. Regen beyond the cap is lost. **From empty, you hit the cap in about 20.8 h.** So to waste nothing you must spend about 11.5k labor per real day, or about 3,840 per hour if you play 3 h a day.
+- **State:** there is **no labor getter** in the API. Labor comes from `LABORPOWER_CHANGED` arguments (A10). Between events, and while offline, the model applies `min(cap, L + 8 × minutes)`. If the event only carries deltas, one seed value (a check-in question, P1, once) anchors it. The seed is re-asked only if the model drifts (a craft's observed labor cost contradicts it).
+- **Outputs:** labor now · **minutes to cap** · labor that will be wasted before your next typical session (from your play-hour pattern) · labor wasted so far (KPI).
+- **Shadow price of labor:**
+  - If the forecast says labor overflows before the next session, the overflow is **free** (0 s/l): burn it on the highest silver-per-minute sink, even a low s/l one.
+  - Otherwise labor costs the best available s/l among the labor sinks (§7.3).
+
+### 6.5 Leadership tracking
+
+- **Source:** `PLAYER_LEADERSHIP_POINT`, `SELF_LEADERSHIP_POINT_CHANGED` chat lines, and hero events. If no absolute value comes through (A11), one value per session is asked.
+- **Periods:** start and end from the hero election/season events, or from you. Leadership **cannot be spent and resets each period**, so it is tracked as progress, not balance.
+- **Modes:**
+  - `election`: you are always elected, so only light tracking and a sanity alert if `HERO_SCORE_UPDATED` shows risk.
+  - `hero`: target **4,000 in the period**, reward **90,000 g + ring** if reached.
+- **Pace:** points needed ÷ days left, required leadership per play-hour, and P(reach) from your observed leadership/hour by method and planned playtime.
+- **Value for the optimizer:** in hero mode the reward is all-or-nothing. A leadership hour is worth `90,000 g × ΔP(reach)` for that hour. When you are comfortably ahead (P > 0.95) it drops to about 0; when you are behind, it can dominate. The website shows the reward's average value (≈ 22.5 g per point) for intuition only.
+- **Methods:** observed leadership per hour for each method in `leadership.source`, filled from the list you will send.
+
+### 6.6 Time metrics
+
+Active and AFK hours per day and week · time by activity and route · **gold per active hour by activity** · labor used vs regenerated and wasted · leadership pace · deaths per hour (a risk factor for packs and ganking) · in-game hour at activity start (`Time:GetGameTime`, a 4-real-hour cycle) and real time vs the event schedule.
 
 ---
 
-## 7. Gold profit engine
+## 7. Gold profit engine (reworked and simpler)
 
-### 7.1 Price basis (kept from `analyze.py`)
+### 7.1 Money truth (all in copper)
 
-Sell price = `min(24h, 7d)`. Buy price = 24h, falling back to 7d, then 30d. AH fee is 5%. Outputs need 24h volume ≥ 20, and a plan may list at most 25% of an item's 24h volume.
+- **Cash:** `Bag:GetCurrency()` + `Bank:GetCurrency()` samples, cross-checked against `X2Util.GetMyMoneyString()` (A9).
+- **Transactions:** sales, purchases, mail, loot, pack sales and taxes from events, linked to segments.
+- **Inventory value:** bag + bank + equipment scans × conservative price (`min(24h, 7d)` from the weekly sheet, or your own last observed price, minus the 5% AH fee). Items with low volume are discounted.
+- **Net profit for a segment** = cash Δ + inventory value Δ − (labor spent × shadow price) − consumables. Unexplained cash change above max(200 g, 5% of turnover) becomes a P0 question.
 
-### 7.2 Three numbers, kept apart
+### 7.2 Activity value model (learns what pays, per hour)
 
-1. **Projected** (plan) comes from `econ.plan`.
-2. **Realized** (ledger) comes from `econ.sale` minus actual `econ.purchase` minus gathering gold. Observed sales pre-fill the plan-line fill-ins as `observed`, and the user confirms with one click, which replaces questions.
-3. **Cash Δ** (wallet) comes from gold samples. Reconciliation: cash Δ − (realized − unsold inventory change) = **unexplained gold**. Above a threshold this becomes a P0 question ("+3,200 g unexplained between 21:10 and 21:40, what happened?").
+For each `activity × sub × context bucket` (sub = route/zone/target; context = real hour block, party size, zone state):
 
-### 7.3 Using observed data to remove manual entry
+- Observed **gold/h**, **labor/h**, **s/labor**, **leadership/h**, **honor/h**, **death rate**, and variance.
+- **Shrinkage:** estimate = (n·observed + k·prior) / (n + k), with k = 3 segment-hours. The prior is your own one-time guess (asked once per activity) or a neutral default.
+- **Trust:** shown as "learning" until ≥ 3 segments and ≥ 1 h of data.
+- **Ranking score per hour** = gold/h + labor/h × (shadow-price adjustment) + leadership value/h (§6.5) − risk penalty (death rate × average loss, e.g. pack loss), filtered by your **priorities** and exclusions.
+- **Exploration:** at most 1 suggestion per day may be an under-sampled activity you haven't excluded, labelled "explore".
 
-| Ledger field | Observed from (if verified) |
-|---|---|
-| Crafted?, Date Crafted | craft concept, or `craft.labor_drop` segments |
-| Actual Craft Labor | labor Δ during the craft segment (captures the proficiency discount) |
-| Date Sold, Qty Sold, Actual Price | AH sale or mail events |
-| Times Listed | AH listing events |
-| Gathering trips | `gathering` segments: labor, minutes, items gained |
+### 7.3 Labor-sink loop (replaces the Excel crafting loop)
 
-### 7.4 Planner
+This is the **one simple loop** for crafting and every other labor use:
 
-`analyze.py` runs as a worker job (on demand and nightly after a new prices sheet). Inputs come from the DB rather than CSV and JSON files, through a thin adapter, so the analyzer itself stays unchanged in the MVP. Its known approximations carry over and are flagged in the UI: per-unit sub-craft labor (round batches up), one recipe variant per output, and the `--labor-value` opportunity cost. **The unit of `COIN_UNIT_GOLD` (copper) is still an assumption** (A25), and the gold samples can check it.
+1. **Inputs, all automatic:** recipes from the game catalog · proficiencies from `ACTABILITY_EXPERT_CHANGED` · prices from the weekly sheet plus your own sales · materials you already hold (inventory and bank scans, which lower the gold needed) · labor now and forecast · pack ratios (hourly snapshots).
+2. **Candidates compete on one list:**
+   - craft X (via `analyze.py`'s recursive coster, unchanged)
+   - open coin purses
+   - craft and run pack route A→B
+   - gather node Y
+   - farm your plot
+3. **Show the top 3** by **silver per labor** *and* **silver per minute**, with:
+   - a volume check (≤ 25% of 24h volume, learned per item from your actual sell-through)
+   - a shopping list
+   - the labor-cap context ("you'll waste 2,100 labor before tomorrow unless you spend about 4k today")
+4. **One tap** "doing it" → a recommendation (§8).
+5. **Measured automatically:** labor drop, items made, sales events. No fill-in cells.
+6. **Learning:** realized sell price and sell-through time per item adjust that item's volume cap and price discount, and a refusal reason becomes an exclusion. This replaces `learnings.md` and the yellow cells.
 
-Staleness check as in the skill: a prices sheet older than this week's Monday gives a banner and a P1 question ("export this week's sheet?").
+The Excel ledger is **retired**. Optional one-time import of existing rows (no gate).
+
+### 7.4 Daily plan (deterministic, then explained by the LLM)
+
+Inputs: planned playtime today (asked or learned from your pattern), labor forecast, leadership mode and pace, schedule events (world bosses and daily events with the DST fix, game-time events), and your priorities. Output: a time-boxed plan such as "45 min packs A→B (2 packs) · burn 3.2k labor on X · raid at 21:00 for leadership", with expected gold, labor use and leadership.
 
 ---
 
 ## 8. Recommendation ledger
 
-Every suggestion, whether from rules, the planner or the LLM, is a row. A suggestion that is not in the ledger is not shown to the user.
+Every suggestion (rules, labor-sink ranker, daily plan, LLM) is a row. A suggestion that is not in the ledger is not shown.
 
 | Field | Meaning |
 |---|---|
-| `rec_id`, `created_at`, `checkin_id` NULL | |
-| `source` | rule:`<id>` / planner:`<plan_id>` / llm:`<call_id>` |
-| `type` | craft_plan, sell_timing, labor_use (cap waste), activity_switch, leadership_opportunity, data_quality, other |
-| `text` | What the user sees |
-| `prediction` jsonb | **Required.** Measurable: metric (gold, s/l, silver/hour, leadership/hour, labor saved), value, range |
-| `assumptions` jsonb | Prices week, volume, proficiency facts used |
-| `eval_window` | e.g. 48 h for craft/sell, end of the next session for activity_switch |
-| `evaluator` | Name of the deterministic function that measures the outcome (e.g. `plan_line_realized`, `segment_rate_compare`) |
+| `rec_id` · `created_at` · `checkin_id` | |
+| `source` | rule:`id` / ranker / planner / llm:`call_id` |
+| `type` | labor_sink, activity_choice, pack_route, sell_timing, labor_cap_warning, leadership_pace, explore, data_quality, other |
+| `text` | What you see |
+| `prediction` | **Required.** Metric + value + range (e.g. silver/min 18 ± 5 for 45 min; labor waste avoided 2,100) |
+| `assumptions` | Prices week, ratios, proficiencies, labor state |
+| `eval_window` · `evaluator` | e.g. `segment_rate(activity, sub)` over the next session; `sales_realized(item)` over 72 h |
 | `status` | proposed → accepted / rejected (reason) / ignored → executed → measured / unmeasurable / expired |
-| `outcome` jsonb | Measured value, delta vs prediction, data-completeness flag |
-| `score` | Hit (within the range) / partial / miss |
+| `outcome` · `score` | Measured from segments and transactions only. Hit / partial / miss. |
 
-**Rules**
-
-- LLM suggestions use structured output, so each one arrives with a `prediction`. A suggestion with no measurable prediction is stored as `type=other`, `status=unmeasurable`, and shown with a "not trackable" tag.
-- Rejections ask for a one-tap reason (too risky / no proficiency / no mats / don't like). Reasons feed `econ.exclusion`, `econ.recipe_requirement` and `econ.learning`, the same adaptive loop as the skill.
-- **Realized outcomes are never invented.** If the data is missing, the status stays `executed` and a P0/P1 question is queued.
-- Hit rate by source and type appears on the website and, compactly, in the LLM's context ("your craft_plan recs: 7/10 hit; sell_timing 2/6"), so the assistant learns to calibrate.
+Hit rates per source and type are shown on the website and fed to the LLM as one line. **Realized values are never invented**; missing data keeps the status at `executed` and queues a question.
 
 ---
 
 ## 9. Hourly check-in
 
-### 9.1 Trigger
+### 9.1 Trigger and delivery
 
-- **Clock = play time.** Due after 60 min of **active, non-AFK** time in the current session since the last check-in (or since login).
-- **Deferral:** if the current segment is `group_content`, `combat_pvp` or `trade_run`, defer in 5-min steps up to 20 min, then notify anyway. AFK pauses the clock.
-- **Notification:** a toast from the uploader plus a badge on the website tab. The user can open it, snooze it (15/30 min), or skip it for this session.
-- **Missed:** not opened within 30 min becomes `missed`. Its questions return to the pool and it doesn't count against the question budget.
-- Logging out with an open check-in runs a short end-of-session wrap-up (same packet, no extra questions beyond the budget).
+- Due after **60 min of active (non-AFK) play** since the last check-in or since login.
+- **Deferred** in 5-min steps (max 20 min) during `pack_run`, `ganking/pvp`, `group_content` combat, or `dead`. AFK pauses the clock.
+- **Delivery:**
+  - desktop notification (uploader)
+  - website badge
+  - optionally **in-game**: the uploader writes `inbox.dat` and the addon shows a small "check-in ready" window (A27)
+- You can open it, snooze it (15/30 min) or skip it for the session. Not opened within 30 min = `missed`; its questions go back to the pool and don't count against the budget.
+- Leaving the world (`LEAVING_WORLD_STARTED`) triggers a short wrap-up.
 
-### 9.2 Check-in content (in order)
+### 9.2 Content and conversation
 
-1. **Deterministic packet** (no LLM): last hour and session so far, broken down into time by activity, gold (cash Δ, realized, unexplained), labor (used, regen, cap-waste minutes), leadership Δ, and the status of open recommendations.
-2. **Questions:** up to the budget (§10), each with quick-reply buttons where possible.
-3. **Suggestion:** one or two LLM recommendations based on the packet and the answers. Each is written to the ledger.
-4. **Open conversation:** the check-in is a **chat thread**. The user can keep talking, give context ("I'm saving for a farmhouse", "guild raid at 21:00"), and ask questions. Messages go to `assistant.message`.
-5. **Close:** at close, or after 30 min of inactivity, a summary (2–5 lines, local LLM) is stored. **Later check-ins carry earlier summaries, not full transcripts**, which keeps tokens flat.
-
-**Event-test helper:** the same website has a **"Marker"** button. The uploader writes `T` records with the click time, so the user can say "now crafting" even if the addon cannot read slash commands.
+1. **Deterministic packet:**
+   - last hour and session: time by activity, gold (cash, transactions, net with inventory), labor (now, to cap, wasted, forecast), leadership (points, pace, P(reach))
+   - open recommendations and their status
+   - next schedule events, in real and game time
+2. **Questions** within the budget (§10), with quick-reply buttons.
+3. **Suggestions:** 1–2 from the ranker or planner, explained by the LLM. Each is in the ledger.
+4. **Ongoing conversation per check-in:** a chat thread where you add context ("guild raid at 21:00", "saving for a farmhouse", "this route got ganked twice") and ask anything. Statements of lasting value are extracted (local LLM) into `knowledge.fact` or `econ.exclusion`, and you confirm each one.
+5. **Close:** a summary (local LLM). Later check-ins carry **summaries, not transcripts**.
 
 ### 9.3 LLM router
 
 | Task | Default | Fallback |
 |---|---|---|
-| Phrase a question, parse a free-text answer into structured data, summarize a check-in | **Local LLM** (7–9B instruct model through Ollama/LM Studio, structured JSON output) | Haiku 5.5 |
-| Check-in suggestion and conversation turns | **Sonnet 5.5** (effort `low`/`medium`) | Haiku 5.5, then local |
-| Daily plan narrative (planner numbers come from `analyze.py`; the LLM only explains and flags risks) | Sonnet 5.5 | Local |
-| Weekly review (recommendation hit rates, trends, learnings) | Sonnet 5.5, `high` effort | Haiku 5.5 |
-| Anything numeric | **Never the LLM.** Numbers come from SQL or the planner and are passed in. | — |
+| Phrase questions, parse answers into facts, summarize threads, extract context | Local (7–9B instruct via Ollama, JSON output) | Haiku 5.5 |
+| Check-in suggestion + conversation | Sonnet 5.5 (effort low/medium) | Haiku 5.5 → local |
+| Daily plan explanation | Sonnet 5.5 (Batch API when not urgent) | local |
+| Weekly review (hit rates, activity value changes, leadership month) | Sonnet 5.5, high effort | Haiku 5.5 |
+| Any number | **SQL and rules only** | — |
 
-**Context per check-in (budget about 8k input tokens):**
-- Frozen, cached prefix (about 5k): system prompt, assistant persona, game-knowledge digest (§11), rules about predictions and the ledger, output schema.
-- Volatile (about 3k): packet, answers, last 3 check-in summaries, recommendation hit-rate line, the user's standing goals and preferences (`knowledge.fact`).
+Context per check-in is about 8k tokens: about 5k cached frozen prefix (persona, rules, a **game-knowledge digest** built from §11 sources, output schema) plus about 3k volatile (packet, answers, last 3 summaries, hit-rate line, standing priorities).
 
 ---
 
 ## 10. Question-budget logic
 
-Questions are the scarcest resource, because every question interrupts play.
-
-### 10.1 Budgets (hard caps)
-
 | Scope | Cap |
 |---|---|
-| Per check-in | **3** (P0 can take a 4th slot only if gold at stake ≥ 1,000 g) |
-| Per play-day | **8** |
-| Per topic (`topic_key`) | One ask per 24 h. Never re-asked within 7 days once answered, unless observed data contradicts the answer. |
-| User-initiated questions and quick confirms of observed data | **Free.** They don't count. |
+| Per check-in | 3 (a 4th only for a P0 with ≥ 1,000 g at stake) |
+| Per play-day | 8 |
+| Per topic | Once per 24 h. Not re-asked within 7 days once answered, unless contradicted by data. |
+| Free (doesn't count) | Your own questions, and one-tap confirmations of observed data |
 
-### 10.2 Candidate generation (rules engine)
+**Candidates**
 
-| Kind | Generated when | Priority |
+| Kind | When | Priority |
 |---|---|---|
-| `ledger_fillin` | A plan line is past its sell window with no observed sale | P0 |
-| `unexplained_gold` | Reconciliation gap > max(200 g, 5% of session turnover) | P0 |
-| `classify_segment` | An `unknown` segment > 10 min, or a confidence < 0.6 segment > 20 min | P1 |
-| `fact` | A rule or the planner needs a missing or expired fact (proficiency, leadership value if not readable, labor regen) | P1 |
-| `stale_prices` | The prices sheet is older than this Monday | P1 (once per week) |
-| `rec_feedback` | A recommendation was proposed with no accept/reject after 1 check-in | P2 |
-| `preference` | Goals, risk appetite, disliked activities | P3 |
+| `unexplained_gold` | Reconciliation gap above threshold | P0 |
+| `labor_seed` | Labor model has no anchor or drifted | P1 (once) |
+| `leadership_value` | Leadership not readable and none reported this session (hero mode only) | P1 |
+| `classify_segment` | `unknown` > 10 min, or confidence < 0.6 for > 20 min | P1 |
+| `period_dates` | Leadership period start/end unknown | P1 |
+| `stale_prices` | Weekly sheet older than this Monday | P1, weekly |
+| `activity_prior` | First time an activity is seen: "what do you usually make per hour doing this?" | P2, once per activity |
+| `rec_feedback` | Proposed recommendation with no response after 1 check-in | P2 |
+| `preference` | Priorities, risk appetite, disliked activities | P3 |
 
-### 10.3 Scoring and selection
-
-`value = priority_weight × min(1, gold_at_stake / 1000) × uncertainty × freshness × (1 / (1 + skip_count))`
-
-- `priority_weight`: P0 = 8, P1 = 4, P2 = 2, P3 = 1.
-- `uncertainty`: 1 − the confidence of the best automated answer. **If observed data can answer it, the question is auto-resolved instead of asked.**
-- `freshness`: decays from 1.0 to 0.3 over 48 h, because old questions are harder to answer.
-- Pick the top-k by value under the caps. Merge questions that share an answer (e.g. three ledger lines for one item become one question with three fields).
-- **Skip handling:** a skipped question gets `skip_count + 1`. Two skips suppress it for 3 days. A suppressed P0 resurfaces in the weekly review instead.
-- **Ask once, learn forever:** answers write `knowledge.fact` entries with a TTL (proficiencies 7 days, preferences until changed, leadership values per session).
+**Selection:** `value = weight(P0=8, P1=4, P2=2, P3=1) × min(1, gold_at_stake/1000) × uncertainty × freshness × 1/(1+skips)`.
+- Anything the data can already answer is **auto-resolved, not asked**.
+- Questions that share an answer are merged.
+- Two skips suppress a question for 3 days.
+- Answers become facts with a TTL.
 
 ---
 
-## 11. Sources you need to provide
+## 11. Sources needed to interpret the game
 
-Interpreting the game correctly depends on these. ★ marks MVP blockers.
-
-| # | Source | Why |
+| # | Source | Status / why |
 |---|---|---|
-| 1 ★ | **`api.lua`** (the file that failed to upload), plus any other `.lua` files and docs in the AAClassic addon SDK or examples folder | The function names, `UI_EVENTS`, E1–E5 and the file-write API decide every placeholder in this plan |
-| 2 ★ | **The addon rules / ToS for ArcheAge Classic** (what addons may read or write, whether file output is allowed) | Gate for Stage 1 |
-| 3 | 1–2 working community addons for AAClassic, if any exist | Shows real event names and file I/O patterns |
-| 4 ★ | `recipes.csv`, `items.csv`, the weekly AH prices CSV, the plants-by-zone CSV | Already used by the skill |
-| 5 ★ | `AA-Trading-Ledger.xlsx` and `skill-data/` (proficiencies, requirements, exclusions, learnings) | Imported in Stage 7 with no loss |
-| 6 ★ | **Labor rules:** regen per tick online/offline, cap, any subscription/patron effect, proficiency discount formula | Labor efficiency, cap waste, actual-labor checks |
-| 7 ★ | **Leadership rules:** how leadership is earned (which content, leader vs member, party size), caps, where it is spent, and the vendor list with prices (to value leadership in gold) | Leadership tracking and leadership-per-hour value |
-| 8 | Currency list and units (gold/silver/copper, honor, vocation, other tokens), and confirmation that "Coin" in recipes is copper | Validates `COIN_UNIT_GOLD` |
-| 9 | Server time zone, daily/weekly reset times, and recurring event schedules (world bosses, guild raids, trade-pack timers) | Check-in deferral, leadership opportunities, sell timing |
-| 10 | Trade-pack routes and payouts (if trade runs are in scope), farm/house plot info | trade_run and farm rules |
-| 11 | Screenshots of the UI for money, labor, leadership, bags and the AH sold tab | Ground truth for the A9–A14 pass checks |
-| 12 | Game patch notes since launch (link or paste) | Rule changes that make facts stale |
-| 13 | Your play profile: characters, typical play hours, goals (e.g. save X gold by date), activities you won't do | Seeds `knowledge.fact` so the first check-ins aren't spent asking |
+| 1 ★ | **PlayerDB and RaidsDB addon folders** (copy them into this repo under `reference/addons/`, or share the folder through Remote Control) | Real `File:Write` output, `_count.dat`/`_files.dat` handling, how they read `request.dat`/`ignore.dat`, and real event arguments |
+| 2 ★ | **Your list of ways to earn leadership** | Fills `leadership.source`; you said it is coming |
+| 3 ★ | **Leadership period dates** and the hero rules: when the month starts and ends, whether "4,000" counts from the period start, and whether the election ranking uses the same points | Pace and P(reach) |
+| 4 ★ | **Confirm larceny** = opening mob coin purses with labor (Larceny proficiency). Coin purse types and typical yields if known. | Labor-sink candidate and fingerprint |
+| 5 | The **HTML link that prints in-game time** | Cross-checks `Time:GetGameTime` and the schedule |
+| 6 | aa-classic.com/timers (noted: the "world bosses" and "daily events" headers run 1 h behind in winter; game-time events are correct) | Seeds `schedule_event` with `dst_correction_h` |
+| 7 | **Daily reset time** (derived ≈ 04:00 UTC from your note; please confirm the exact time and the server time zone) | Day boundaries, daily-event planning |
+| 8 | What `PREMIUM_LABORPOWER_CHANGED` means for you (patron/premium labor?) and whether premium changes regen or cap | Labor model |
+| 9 | Pack basics: which packs you run, their craft cost and labor, typical routes, carry risk | Seeds priors; the ratios come from `Store:*` |
+| 10 | Gank and PvP context: faction, the zones you hunt in, and whether stolen packs count as your profit (yes, presumably) | Fingerprint + value |
+| 11 | Sample chat lines in your client language for `SELF_MONEY_CHANGED`, `SELF_LEADERSHIP_POINT_CHANGED`, `ADDED_ITEM_SELF`, combat kill lines (a screenshot or copy) | Chat parse patterns |
+| 12 | Weekly AH prices CSV (still useful for prices), `items.csv` | Prices. Recipes now come from the game. |
+| 13 | Your priorities and play profile: typical play hours per weekday, gold goals, risk tolerance, activities you refuse | Seeds facts so early check-ins don't have to ask |
+| 14 | Game patch notes going forward | Triggers a short re-test and catalog run |
 
 ---
 
 ## 12. Claude call budget (< $10/month)
 
-Prices (per million tokens, first-party API, current at time of writing): **Haiku 5.5** $0.10 in / $0.50 out · **Sonnet 5.5** $2 in / $10 out, cache read $0.20 · Opus 5.5 $4 / $20 (not used routinely) · Batch API −50%. Cache writes cost more than plain input (verify the exact multiplier on the live pricing page when building). The 5-min cache **won't survive between hourly check-ins**, but it does help across turns inside one check-in.
+Prices per million tokens (first-party API): **Haiku 5.5** $0.10 in / $0.50 out · **Sonnet 5.5** $2 / $10, cache read $0.20 · Batch −50%. The 5-min cache helps within a check-in thread, not between hourly check-ins.
 
-**Usage assumption:** 3 h/day × 30 days = **90 check-ins/month**, 3 user turns each.
+Assumption: 3 h/day × 30 days = 90 check-ins, about 3 turns each.
 
 | Item | Per unit | Count/month | Monthly |
 |---|---|---|---|
-| Check-in open (Sonnet): 5k prefix cache write + 3k volatile + 600 out | ≈ $0.025 | 90 | $2.25 |
-| Check-in turns (Sonnet): about 9k in (mostly cache reads) + 400 out | ≈ $0.008 | 270 | $2.16 |
-| Daily plan narrative (Sonnet, Batch API overnight): 12k in + 1.5k out | ≈ $0.02 | 30 | $0.60 |
-| Weekly review (Sonnet, `high`): 30k in + 4k out | ≈ $0.10 | 4 | $0.40 |
-| Answer parsing and summaries (local LLM; Haiku fallback ≈ $0.0005 each) | ~$0 | 300 | ≤ $0.15 |
-| **Expected total** | | | **≈ $5.6** |
-| Safety margin (longer chats, retries) | | | → cap **$9.00** |
+| Check-in open (Sonnet): about 8k in (5k cache write) + 600 out | ≈ $0.025 | 90 | $2.25 |
+| Check-in turns (Sonnet): about 9k in, mostly cache reads, + 400 out | ≈ $0.008 | 270 | $2.16 |
+| Daily plan explanation (Sonnet, Batch) | ≈ $0.02 | 30 | $0.60 |
+| Weekly review (Sonnet, high effort) | ≈ $0.10 | 4 | $0.40 |
+| Parsing, summaries, fact extraction (local; Haiku fallback) | ≈ $0 | ~400 | ≤ $0.20 |
+| **Expected** | | | **≈ $5.6** |
+| **Hard cap** | | | **$9.00** |
 
-**Enforcement (in the router, before every call):**
-- Estimate the call cost from token counts and refuse it if `spent + estimate > cap`.
-- Modes by month-to-date spend vs a linear projection: `normal` (< 70% of cap), `conserve` at 70% (check-in opens move to Haiku, turns capped at 2, daily narrative to local), `local_only` at 90% (Claude only for the weekly review). Shown on the website.
-- Per-check-in ceiling of $0.15. When hit, the thread continues on the local LLM with a notice.
-- Every call is logged in `assistant.llm_call` with the actual `usage` from the response. The month's spend is computed from real usage, not estimates.
-- No tool loops in the MVP (packet-in, structured-out), so cost is bounded per call.
+**Enforcement:**
+- Estimate the cost before every call and refuse it if spent + estimate > cap.
+- Modes:
+  - `normal` below 70% of the cap
+  - `conserve` at 70%: opens move to Haiku, max 2 turns per check-in, daily explanation goes local
+  - `local_only` at 90%: Claude only for the weekly review
+- Per-check-in ceiling $0.15, after which the thread continues on the local LLM.
+- Spend is computed from the real `usage` in each response. Every call is logged.
 
 ---
 
 ## 13. Assumptions the event test must confirm
 
-The **event test** runs probe v0.2 and follows a fixed script, about 45 min. The user presses Marker before each step: login → idle 2 min → open bags → walk 200 m → craft 1 known recipe → gather 1 node → list 1 item on the AH → buy 1 item on the AH → collect mail/AH proceeds → join a party → become leader → fight a mob → zone change → `/reload` (if allowed) → logout.
+**Protocol (probe mode, about 60–90 min, spread over normal play).** Press the in-game marker before each step:
+
+login → idle 3 min (AFK) → open bags and bank → walk and glide 300 m → change zone → craft 1 recipe → craft 1 trade pack, carry it, sell it → fish 5 min → gather 3 nodes → farm your plot → kill 5 mobs → open coin purses → list 1 AH item → wait for any AH sale → collect mail money → join a party, then a raid, become leader → leadership-earning activity (from your list) → PvP or gank if the chance comes up → die once (optional) → `/reload` → logout.
 
 | ID | Assumption | Pass | Fail → consequence |
 |---|---|---|---|
-| A1 | `api.On` with each `UI_EVENTS` name can be called in `pcall` without crashing the client | All registrations return; the client keeps running; per-event mode recorded | Register in batches of 20 to find the culprits; mark them `unsafe` |
-| A2 | E1–E5 fire with stable argument shapes | Each fires ≥ 1× during the script (or the step that should trigger it is documented), with consistent `n` and types | Mark `dead`/`unverified`; rules that need them stay inactive |
-| A3 | Each `UI_EVENTS` entry can be classified | 100% of entries end as registered/fired/dead/unsafe; ≥ 1 sample payload stored for each fired event | Repeat the test with an extended script |
-| A4 | The addon can create new files with arbitrary names under `Documents/AAClassic/Addon/<addon>/` | 100 consecutive chunks written; uploader validates 100/100; 0 truncated | If only one fixed file (e.g. saved variables) works, switch to a ring-buffer format in one file. A minor format change, and the uploader tails it. |
-| A5 | Which of append/rename/delete/list exist | Documented yes/no for each | Write-once chunks need none of them |
-| A6 | A clock exists (wall and/or monotonic) with ≤ 1 s resolution | Drift between addon `ms` and file mtime < 2 s over 1 h | Use frame/timer accumulation; the uploader stamps wall time from mtime |
-| A7 | A timer or update hook exists for polling | Measured callback rate is stable within ±20% | Poll only on events; snapshots become event-driven |
-| A8 | Full subscription doesn't hurt play | Handler + poller time < 1 ms/frame on average, no hitch > 50 ms in a crowded town for 10 min, no visible FPS drop | Cut to the `lean` profile: drop or sample the noisiest events |
-| A9 | Gold can be read (getter or event) | Matches the UI after 5 transactions, to the copper | Gold from the AH/mail events plus manual entries; cash reconciliation turned off |
-| A10 | Labor can be read (current and max) | Matches the UI after craft and gather; regen ticks are visible | Labor efficiency estimated from recipes plus user input |
-| A11 | Leadership can be read | Matches the UI before and after one group activity | One leadership question per session (§6.4) |
-| A12 | Inventory can be read, or item gains/losses arrive as events | Craft output and gathered items appear within 30 s | Craft and gather rules lose confidence; more classify questions |
-| A13 | Craft completion can be identified (item, qty) | The scripted craft produces a matching record | Use `craft.labor_drop` only |
-| A14 | AH listing, sale and mail proceeds can be identified | The scripted list, buy and collect each leave a record with item, qty and price | Ledger fill-ins stay manual (P0 questions) |
-| A15 | Position and zone can be read | Walking 200 m and changing zone show up | No travel or AFK-by-movement; AFK falls back to "no events" |
-| A16 | Party/raid state and leader flag can be read | The join and lead steps are visible | group_content needs user labels |
-| A17 | Character name and server can be read | Correct in the header | One-time setup question per install |
-| A18 | A logout/reload/zone hook exists, so the last chunk is flushed | The final chunk has `closed=logout` | Accept ≤ 60 s loss; shorten rotation to 30 s |
-| A19 | Handlers survive `/reload` and zoning | Events keep arriving after both | Re-register on a load event; documented |
-| A20 | Data volume is manageable | ≤ 20 MB/h raw after sampling; no single event > 2 records/s after sampling | Tighten the sampler; trim the payload depth |
-| A21 | An erroring handler doesn't break others or spam chat | A forced error in one handler leaves the others firing; no chat spam | Wrap all handlers; never print to chat |
-| A22 | `pairs(api)` introspection works | Manifest has > 0 entries with types | Allow-list built by hand from `api.lua` |
-| A23 | Item names with non-ASCII characters serialize correctly | Names round-trip byte-exact to Postgres | Escape them in the serializer |
-| A24 | The ToS allows a read-only, file-writing addon | Written confirmation from the rules or a GM | **Stop.** Fall back to a manual/screenshot workflow |
-| A25 | Recipe "Coin" amounts are copper | A craft with a fee shows gold Δ = fee in copper (± 0) | Fix `COIN_UNIT_GOLD`; re-run plans; add a learning |
+| A1 | `api.On` accepts all 206 `UI_EVENTS` + 4 under `pcall` without crashing | All return; client stable for 30 min; mode recorded per event | Register in halves to find the culprit and mark it `unsafe` |
+| A2 | The 5 documented events behave as described (`UPDATE` dt in ms each frame; the other 4 fire on their trigger) | `UPDATE` dt ≈ frame time; each of the other 4 fires during its step | Use `api:DoIn` for timing; mark the others dead |
+| A3 | Each `UI_EVENTS` entry ends classified | 100% classified registered/fired/dead/unsafe, with ≥ 1 sample per fired event | Extend the script |
+| A4 | `api.File:Write` creates new files at `aacs/out/<name>.dat` (relative to `api.baseDir`) with arbitrary names; the write is complete on return | 200 consecutive chunks parse; 0 partial | Fixed-name ring files (`slot_000..999`) |
+| A5 | `api.File:Write` output is a Lua table literal our parser handles (nesting, escapes, unicode, numbers, booleans) | Byte-exact round trip on 5 test tables (incl. non-ASCII item names) | Adjust the parser to the real format |
+| A6 | `Time:GetUiMsec` is monotonic; `Time:GetLocalTime` gives wall time | Drift vs file mtime < 2 s over 1 h; note whether `GetUiMsec` resets on `/reload` | Re-anchor `ui_ms0` on each `UI_RELOADED` |
+| A7 | `UPDATE` + a dt accumulator gives stable timing; `api:DoIn` works | Timer jitter ±20% | Rely on `DoIn` |
+| A8 | Full capture doesn't hurt play | Handler + poller < 1 ms/frame on average, no hitch > 50 ms, no FPS drop in a crowded town for 10 min | Drop to the `lean` profile |
+| A9 | `Bag:GetCurrency()` returns copper and matches the UI; `PLAYER_MONEY` fires on change | Matches after 5 transactions, to the copper; ratio to `GetMyMoneyString` consistent | Find the unit factor and log it |
+| A10 | `LABORPOWER_CHANGED` carries labor (absolute or delta) | Craft and gather steps give values consistent with the in-game labor UI; regen ticks visible or modelable at 8/min | One labor seed question per session + model only |
+| A11 | Leadership readable via `PLAYER_LEADERSHIP_POINT` or `SELF_LEADERSHIP_POINT_CHANGED` | Value or delta matches the UI after a leadership activity | One leadership question per session |
+| A12 | Bag scan via `Bag:GetBagItemInfo(1, i)` gives item ID + count; `ADDED_ITEM`/`REMOVED_ITEM` carry the item | Crafted, gathered and looted items appear within 5 s | Rescan-only, lower confidence |
+| A13 | Bank contents readable via `Bank:GetLinkText(slot)` (bank window closed vs open) | Parsed links match the bank UI | Bank valued only when the bank window was opened |
+| A14 | `AUCTION_BOUGHT_BY_SOMEONE` identifies your sold item (item, qty, price) | Fires on a real sale with parseable arguments; gold after mail collection matches price × 0.95 | Infer from mail money + listing records |
+| A15 | `SELL_SPECIALTY` + `BACKPACK` equipment slot identify pack runs and payouts | Pack step recorded end to end | Pack runs from gold + position only |
+| A16 | `Store:*` ratio getters return the pack price table | Values consistent with the trade-outlet UI | Use manual route priors |
+| A17 | Position and zone (`UnitWorldPosition`, `GetCurrentZoneGroup`, `GetPlayerSextants`) | Walk and zone steps visible | AFK and travel from events only |
+| A18 | `LEAVING_WORLD_STARTED` fires before logout with time to write | Final chunk has `closed="logout"` | Accept ≤ 60 s loss; rotate every 30 s |
+| A19 | Handlers survive `/reload` (or are re-registered by addon reload) and `UI_RELOADED` fires | Events continue after reload | Re-register in boot |
+| A20 | Data volume ≤ 20 MB/h after sampling; no event > 2 records/s | Measured | Tighten the sampler |
+| A21 | A handler error doesn't break other handlers or print to chat | Forced error test | Wrap everything; `Log` off |
+| A22 | `pairs(api)` introspection works; `Quest`/`ItemEnchant`/`Map`/`Zone`/`Craft` exist at runtime | Manifest lists them | Drop those getters |
+| A23 | Combat target type (NPC vs player) and faction readable via `UnitInfo`/`GetFactionName` | Mob and player targets separable | Ganking only from honor + chat lines |
+| A24 | Crime and larceny visible (`CRIME_REPORTED`, `GetCrimeInfo`, coin purse items, Larceny proficiency) | Coin-purse step recorded with labor and gold | Larceny from item removal + labor only |
+| A25 | Recipe "Coin" = copper | A craft with a fee shows gold Δ = fee in copper | Fix the unit factor |
+| A26 | Catalog run: `Craft:GetCraftTypesByName` enumerates all recipes without hitches when throttled | Recipe count is the same order as `recipes.csv`; no hitch > 50 ms | Keep `recipes.csv` |
+| A27 | `api.File:Read` sees `inbox.dat` changes made while the game runs (as `request.dat`/`ignore.dat` do for PlayerDBSync) | New `msg_id` shown in game within 35 s | Desktop notification only |
+| A28 | `Time:GetGameTime` returns in-game time consistent with the 4-hour cycle and the HTML game-time link | Matches within 1 game minute | Compute from the anchor + cycle |
+| A29 | Hero events carry the period dates and score or rank | Dates and score readable | Ask once per period |
+| A30 | The ToS allows a read-only, file-writing addon of this scope (as PlayerDB/RaidsDB already are) | Your confirmation | Reduce the scope |
 
 ---
 
 ## 14. Build stages with pass/fail criteria
 
-| Stage | Deliverable | Pass criteria | Fail action |
+| Stage | Deliverable | Pass | Fail action |
 |---|---|---|---|
-| **S0 Sources** | Items in §11 marked ★ supplied | `api.lua` present; `UI_EVENTS` count N and E1–E5 names extracted; file-write API identified; A24 answered yes; CSVs and ledger present | Cannot start S1 without `api.lua` and A24 |
-| **S1 Probe v0.1** (introspection + E1–E5 only) | Addon loads; writes manifest and header chunks | Loads with 0 Lua errors over 3 logins; manifest written; ≥ 1 of E1–E5 seen; uploader not needed yet (files read by hand) | Fix and repeat; if file writes are impossible, re-plan §3 (A4) |
-| **S2 Event test** (probe v0.2, all `UI_EVENTS`) | `catalog.event_test` result | A1–A25 each marked pass/fail/unknown with evidence; **minimum to go on: gold (A9) or AH events (A14) work, labor (A10) works, a clock or timer (A6/A7) works, files (A4) work** | If the minimum fails, stop the automatic route: MVP becomes a manual-entry website plus planner, and the addon is shelved |
-| **S3 Capture v1.0** | Daily-use addon with the allow-list from S2 | 3 real sessions ≥ 1 h each; 0 client crashes; seq gaps cover ≤ 60 s per session; A8 performance budget met; ≤ 20 MB/h | Drop to the `lean` profile; re-test |
-| **S4 Uploader** | Go binary, tray, toast | Kill test (uploader killed mid-insert 10×): 0 duplicates, 0 losses; 24 h offline backlog catches up in < 5 min; bad files quarantined with a reason; toast shows over full-screen | Fix before any derived work |
-| **S5 DB + derive** | Schemas `raw`, `catalog`, `core`, `knowledge` | Full rebuild of `core.*` from `raw.*` twice gives identical results (row hashes equal); dashboard queries < 200 ms on 1 month of data; disk use measured and projected | Fix non-determinism (time zones, ordering) |
-| **S6 Rules engine** | §6 rules + gold reconciliation | On the labeled event-test session: ≥ 85% of seconds correct for activities whose inputs are verified; `unknown` < 25% over 3 real sessions; session bounds within ±1 min; gold and labor samples match the UI exactly | Tune thresholds; add rules; more classify questions as a stopgap |
-| **S7 Website + ledger** | Dashboard, ledger, planner, import | Excel import keeps row counts and totals equal; planner output identical to the `analyze.py` CLI for the same inputs; daily view shows time by activity, gold (3 numbers) and leadership | Fix the adapter |
-| **S8 Check-in** | Scheduler, packet, questions, chat, router, budget | Over 1 week: check-ins fire within ±5 min of the due play-hour; 0 during group_content/PvP (unless the 20-min deferral cap is hit); question caps never exceeded; median user time per check-in < 2 min; every LLM call logged with real usage; projected month < $10 | Tune deferral or budgets; switch routing to cheaper models |
-| **S9 Recommendation loop** | Ledger, evaluators, hit-rate display | 100% of shown recommendations are in the ledger with a prediction (or tagged unmeasurable); ≥ 80% reach measured/unmeasurable/expired within their window; hit rate visible per source and type; 0 invented realized values (audit: every `measured` row links to sale or sample records or a user answer) | Fix evaluators; stop LLM types that can't be measured |
+| **S0 Sources** | §11 ★ items | `api.lua` ✓; example addons in `reference/addons/`; leadership list + period rules; larceny confirmed; A30 confirmed | S1 can start without the leadership list; S6 can't finish without it |
+| **S1 Probe v0.1** (introspection + 5 documented events + `File:Write` test) | First `.dat` files | Loads with 0 Lua errors over 3 logins; manifest written; A4, A5, A6, A22 pass | Adjust the format (ring files, parser) |
+| **S2 Event test** (probe, all events + getters) | `catalog.event_test` | A1–A29 each with a verdict and evidence. **Go/no-go minimum: A4, A5, A6/A7, A9, and A10 or a labor seed workflow.** | If gold (A9) fails: stop and rethink, since the core value depends on it |
+| **S3 Capture v1.0** | Daily addon | 3 sessions ≥ 1 h; 0 crashes; ≤ 60 s lost per session; A8 and A20 budgets met | `lean` profile |
+| **S4 Uploader** | Linux binary + service | Kill/restart 10× during a backlog: 0 duplicates, 0 losses; 24 h backlog catches up in < 5 min; cleanup never runs while the game runs; inbox writes are atomic | Fix |
+| **S5 DB + parser** | `raw` → `core` | Reparse of all chunks is deterministic (equal row hashes twice); 1-month queries < 200 ms; parse failures 0% on S3 data | Fix the parser or time zones |
+| **S6 Rules + labor + leadership** | §6 | On the labeled event-test session: ≥ 85% of seconds correct for verified activities; `unknown` < 25% over a week; gold matches the UI to the copper; labor model within ±2% of the UI at 3 spot checks; leadership pace shown | Tune rules; more labels |
+| **S7 Website + labor-sink loop** | Dashboard, activities, sinks, leadership | Labor-sink top 3 reproduces `analyze.py` numbers for crafts; pack and coin-purse options appear once data exists; labor-waste forecast visible; Excel optional | Fix the ranker |
+| **S8 Check-in** | Scheduler, packet, questions, chat, router, budget | 1 week: on-time ±5 min of the due play-hour; 0 interruptions during pack runs or PvP before the 20-min cap; question caps never exceeded; median time per check-in < 2 min; monthly projection < $10 from real usage; in-game inbox works (if A27) | Tune deferral or budgets |
+| **S9 Learning loop** | Ledger, evaluators, activity model, classifier | 100% of shown recommendations in the ledger with a prediction; ≥ 80% resolved within their window; activity gold/h shown with n and confidence; classifier enabled only where it beats the rules on held-out data; 0 invented outcomes (audit) | Fix evaluators; keep the rules |
 
-**Order and dependencies:** S0 → S1 → S2 is a strict gate. S4 and S5 can run in parallel with S3. S6 needs S2 + S5. S7 needs S5 (and S6 for the observed fill-ins). S8 needs S6 + S7. S9 needs S8.
+Dependencies: S0 → S1 → S2 is a strict gate. S4 and S5 run alongside S3. S6 needs S2 + S5. S7 needs S6. S8 needs S6 + S7. S9 needs S8.
 
 ---
 
-## 15. Out of scope for the MVP (noted for later)
+## 15. Out of scope for the MVP
 
-Multi-user hosting, mobile app, LLM tool use over the DB (read-only SQL tools), trade-pack route optimizer, a price-history scraper replacing the weekly CSV, multi-character labor planning, voice check-ins.
+Screenshots/OCR (possible, as PlayerDBSync does, but not cost-efficient now) · multi-user hosting · live AH price scraping · LLM tool access to the DB · automated route optimizer beyond ranking observed routes · voice.
