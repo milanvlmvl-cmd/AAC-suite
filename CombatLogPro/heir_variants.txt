@@ -1,0 +1,4 @@
+{
+    ["Endless Arrows"] = 1,
+    ["Alarm Call"] = 2,
+}
